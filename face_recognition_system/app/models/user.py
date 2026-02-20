@@ -21,3 +21,4 @@ class User(Base):
     company = relationship("Company", back_populates="users")
     face_profiles = relationship("FaceProfile", back_populates="user", cascade="all, delete-orphan")
     logs = relationship("VerificationLog", back_populates="user")
+    attendance_records = relationship("AttendanceRecord", back_populates="user", cascade="all, delete-orphan")

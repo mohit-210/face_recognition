@@ -24,7 +24,8 @@ class LivenessDetector:
         challenge = self._challenge_score(landmarks, expected_challenge, challenge_response)
         motion = self._motion_score(face_bgr, previous_face_bgr)
 
-        final_score = (0.35 * texture) + (0.20 * (1 - moire)) + (0.25 * challenge) + (0.20 * motion)
+        # Keep motion as a weaker signal so stable real users are not rejected too aggressively.
+        final_score = (0.40 * texture) + (0.25 * (1 - moire)) + (0.20 * challenge) + (0.15 * motion)
         return float(max(0.0, min(1.0, final_score)))
 
     def _texture_score(self, face_bgr: np.ndarray) -> float:
@@ -39,7 +40,7 @@ class LivenessDetector:
         magnitude = np.log(np.abs(fft) + 1)
         high_freq_energy = float(np.mean(magnitude[magnitude > np.percentile(magnitude, 90)]))
         # Strong repeated high-frequency patterns can indicate display replay.
-        return float(min(1.0, high_freq_energy / 15.0))
+        return float(min(1.0, high_freq_energy / 22.0))
 
     def _challenge_score(self, landmarks: dict, expected: str | None, response: str | None) -> float:
         if not expected:
@@ -66,9 +67,21 @@ class LivenessDetector:
 
     def _motion_score(self, face_bgr: np.ndarray, previous_face_bgr: np.ndarray | None) -> float:
         if previous_face_bgr is None or previous_face_bgr.size == 0:
-            return 0.5
+            return 0.6
         current_gray = cv2.cvtColor(cv2.resize(face_bgr, (128, 128)), cv2.COLOR_BGR2GRAY)
         prev_gray = cv2.cvtColor(cv2.resize(previous_face_bgr, (128, 128)), cv2.COLOR_BGR2GRAY)
         flow = cv2.absdiff(current_gray, prev_gray)
         motion = float(np.mean(flow))
-        return float(min(1.0, motion / 25.0))
+        # Robust piecewise mapping:
+        # - tiny motion still gets partial credit (stable live face)
+        # - moderate motion gets strong credit
+        # - excessive motion is capped
+        if motion < 1.2:
+            return 0.50
+        if motion < 3.0:
+            return float(0.35 + ((motion - 1.2) / 1.8) * 0.30)
+        if motion < 18.0:
+            return float(0.65 + ((motion - 3.0) / 15.0) * 0.35)
+        if motion <= 40.0:
+            return 1.0
+        return 0.80

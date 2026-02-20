@@ -11,7 +11,7 @@ router = APIRouter(prefix="/company", tags=["Company"])
 
 @router.post("", response_model=CompanyRead)
 def create_company(payload: CompanyCreate, db: Session = Depends(get_db), _=Depends(get_current_user)):
-    return CompanyService(db).create(payload.name)
+    return CompanyService(db).create(payload.name, payload.organization_type)
 
 
 @router.get("", response_model=list[CompanyRead])

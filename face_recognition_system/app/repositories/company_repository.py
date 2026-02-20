@@ -7,8 +7,8 @@ class CompanyRepository:
     def __init__(self, db: Session) -> None:
         self.db = db
 
-    def create(self, name: str) -> Company:
-        company = Company(name=name)
+    def create(self, name: str, organization_type: str = "company") -> Company:
+        company = Company(name=name, organization_type=organization_type)
         self.db.add(company)
         self.db.commit()
         self.db.refresh(company)

@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user
 from app.database.session import get_db
 from app.schemas.face import FaceRegisterRequest, FaceRegisterResponse, FaceVerifyRequest, FaceVerifyResponse
+from app.services.attendance_service import AttendanceService
 from app.services.face_service import FaceService
 from app.services.user_service import UserService
 
@@ -32,4 +33,9 @@ def verify_face(payload: FaceVerifyRequest, db: Session = Depends(get_db), curre
         previous_image_base64=payload.previous_image_base64,
         device_id=payload.device_id,
     )
+    if payload.mark_attendance and result.get("verified"):
+        AttendanceService(db).mark_verified_face(
+            company_id=payload.company_id,
+            user_id=payload.user_id,
+        )
     return FaceVerifyResponse(**result)

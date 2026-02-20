@@ -1,0 +1,25 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<section class="dashboard-shell">
+  {% include "admin/sidebar.html" %}
+  <section class="module-board">
+    <article class="card module-card">
+      <h2>Organization Overview</h2>
+      <div class="stats-grid">
+        <div class="stat-item"><span>Company ID</span><strong>{{ current_user.company_id }}</strong></div>
+        <div class="stat-item"><span>Total Organizations</span><strong>{{ companies|length }}</strong></div>
+        <div class="stat-item"><span>Total Users</span><strong>{{ users|length }}</strong></div>
+        <div class="stat-item"><span>Total Logs</span><strong>{{ logs|length }}</strong></div>
+      </div>
+    </article>
+
+    <article class="card module-card">
+      <h2>Create Organization</h2>
+      <form method="post" action="/admin/company/create" class="row-form">
+        <input type="text" name="name" placeholder="New company/society name" required />
+        <button type="submit">Add Organization</button>
+      </form>
+    </article>
+  </section>
+</section>
+{% endblock %}

@@ -23,6 +23,9 @@ class Settings(BaseSettings):
 
     recognition_threshold: float = Field(default=0.45, ge=0.0, le=1.0)
     liveness_threshold: float = Field(default=0.65, ge=0.0, le=1.0)
+    attendance_liveness_threshold: float = Field(default=0.48, ge=0.0, le=1.0)
+    attendance_min_motion_diff: float = Field(default=1.6, ge=0.1, le=20.0)
+    attendance_auto_checkout_after_minutes: int = Field(default=480, ge=1, le=1440)
 
     model_path: str = "./models"
 

@@ -1,5 +1,7 @@
 from functools import lru_cache
 import time
+import numpy as np
+import cv2
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
@@ -34,6 +36,19 @@ class FaceService:
     @staticmethod
     def _invalidate_company_index(company_id: int) -> None:
         _company_index_cache.pop(company_id, None)
+
+    @staticmethod
+    def _resize_for_identify(image: np.ndarray, max_side: int = 640) -> np.ndarray:
+        h, w = image.shape[:2]
+        longest = max(h, w)
+        if longest <= max_side:
+            return image
+        scale = max_side / float(longest)
+        return cv2.resize(
+            image,
+            (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
 
     def _get_company_index(self, company_id: int) -> list[dict]:
         now = time.monotonic()
@@ -188,8 +203,11 @@ class FaceService:
         image_base64: str,
         device_id: str | None,
         enforce_liveness: bool = True,
+        previous_image_base64: str | None = None,
+        require_live_motion: bool = False,
     ) -> dict:
         image = self.detector.decode_image(image_base64)
+        image = self._resize_for_identify(image, max_side=640)
         liveness_score = 1.0
         if not enforce_liveness:
             try:
@@ -205,6 +223,14 @@ class FaceService:
                     "reason": reason,
                 }
         else:
+            previous_image = None
+            if previous_image_base64:
+                try:
+                    previous_image = self.detector.decode_image(previous_image_base64)
+                    previous_image = self._resize_for_identify(previous_image, max_side=640)
+                except ValueError:
+                    previous_image = None
+
             detections = self.detector.detect(image)
             if not detections:
                 return {
@@ -238,8 +264,66 @@ class FaceService:
 
             det = detections[0]
             face = self.detector.crop_face(image, det["bbox"])
-            liveness_score = self.engine.liveness.score(face, det.get("landmarks", {}))
-            if liveness_score < self.engine.settings.liveness_threshold:
+            previous_face = None
+            if previous_image is not None:
+                # Reuse current-frame bbox for previous frame to avoid another heavy detector call.
+                # Both frames come from the same camera stream and are close in time.
+                previous_face = self.detector.crop_face(previous_image, det["bbox"])
+
+            if require_live_motion and previous_image is None:
+                return {
+                    "verified": False,
+                    "user_id": None,
+                    "name": None,
+                    "confidence": 0.0,
+                    "liveness_score": 0.0,
+                    "reason": "Live scan required (need consecutive frames)",
+                }
+            if (
+                require_live_motion
+                and previous_face is not None
+                and previous_face.size > 0
+                and face.size > 0
+            ):
+                if previous_face.shape[:2] != face.shape[:2]:
+                    previous_face = self.detector.crop_face(previous_image, det["bbox"], pad_ratio=0.0)
+                    if previous_face.shape[:2] != face.shape[:2]:
+                        previous_face = None
+            if (
+                require_live_motion
+                and previous_face is not None
+                and previous_face.size > 0
+                and face.size > 0
+            ):
+                diff = float(np.mean(np.abs(face.astype(np.float32) - previous_face.astype(np.float32))))
+                if diff < 0.8:
+                    return {
+                        "verified": False,
+                        "user_id": None,
+                        "name": None,
+                        "confidence": 0.0,
+                        "liveness_score": 0.0,
+                        "reason": "Replay suspected (near-identical consecutive frames)",
+                    }
+                if diff < float(self.engine.settings.attendance_min_motion_diff):
+                    return {
+                        "verified": False,
+                        "user_id": None,
+                        "name": None,
+                        "confidence": 0.0,
+                        "liveness_score": 0.0,
+                        "reason": "Move head slightly for live check",
+                    }
+
+            liveness_score = self.engine.liveness.score(
+                face,
+                det.get("landmarks", {}),
+                previous_face_bgr=previous_face,
+            )
+            required_liveness = self.engine.settings.liveness_threshold
+            if require_live_motion:
+                required_liveness = min(required_liveness, self.engine.settings.attendance_liveness_threshold)
+            if liveness_score < required_liveness:
                 return {
                     "verified": False,
                     "user_id": None,
@@ -250,7 +334,7 @@ class FaceService:
                 }
 
             try:
-                query_emb = self.engine.embedder.get_embedding(face)
+                query_emb, _ = self.engine.embedder.get_best_embedding(face)
             except ValueError:
                 return {
                     "verified": False,

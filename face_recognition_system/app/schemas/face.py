@@ -17,6 +17,7 @@ class FaceVerifyRequest(BaseModel):
     company_id: int
     user_id: int
     image_base64: str
+    mark_attendance: bool = True
     expected_challenge: str | None = None
     challenge_response: str | None = None
     previous_image_base64: str | None = None

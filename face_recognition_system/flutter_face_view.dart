@@ -1,8 +1,6 @@
 import 'dart:typed_data';
-
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-
 import 'flutter_face_api_client.dart';
 
 class FaceOpsPage extends StatefulWidget {
@@ -13,32 +11,28 @@ class FaceOpsPage extends StatefulWidget {
 }
 
 class _FaceOpsPageState extends State<FaceOpsPage> {
-  final TextEditingController _baseUrlCtrl = TextEditingController(text: 'http://10.0.2.2:8000');
+  final TextEditingController _baseUrlCtrl = TextEditingController(text: 'http://');
   final TextEditingController _companyIdCtrl = TextEditingController();
   final TextEditingController _adminCodeCtrl = TextEditingController();
   final TextEditingController _adminPasswordCtrl = TextEditingController();
 
-  final TextEditingController _newNameCtrl = TextEditingController();
-  final TextEditingController _newEmployeeCodeCtrl = TextEditingController();
-  final TextEditingController _newPasswordCtrl = TextEditingController();
-
-  final TextEditingController _verifyUserIdCtrl = TextEditingController();
-
   CameraController? _cameraController;
-  FaceApiClient? _apiClient;
-  FaceVerificationScanner? _scanner;
+  List<CameraDescription> _availableCameras = [];
+  CameraLensDirection _currentLens = CameraLensDirection.front;
 
-  final List<Uint8List> _enrollPhotos = <Uint8List>[];
+  FaceApiClient? _apiClient;
 
   bool _initializingCamera = false;
   bool _busy = false;
   bool _loggedIn = false;
   bool _capturing = false;
-  bool _scanning = false;
-  bool _verifiedLocked = false;
 
   String _status = 'Ready';
-  String _scanStatus = 'Not started';
+  String _attendanceStatus = 'No face matched yet.';
+  String _approvalLabel = 'Approve Mark In';
+  AttendanceScanResponse? _pendingMatch;
+  AttendanceMarkRead? _lastMarked;
+  Uint8List? _previousAttendanceFrame;
 
   @override
   void initState() {
@@ -51,9 +45,11 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
       _initializingCamera = true;
       _status = 'Initializing camera...';
     });
+
     try {
-      final cameras = await availableCameras();
-      if (cameras.isEmpty) {
+      _availableCameras = await availableCameras();
+
+      if (_availableCameras.isEmpty) {
         setState(() {
           _status = 'No camera found on device.';
           _initializingCamera = false;
@@ -61,31 +57,54 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
         return;
       }
 
-      final CameraDescription selected = cameras.firstWhere(
-        (c) => c.lensDirection == CameraLensDirection.front,
-        orElse: () => cameras.first,
+      final selected = _availableCameras.firstWhere(
+            (c) => c.lensDirection == _currentLens,
+        orElse: () => _availableCameras.first,
       );
 
       final controller = CameraController(
         selected,
-        ResolutionPreset.medium,
+        ResolutionPreset.low,
         enableAudio: false,
       );
+
       await controller.initialize();
 
       if (!mounted) return;
+
       setState(() {
         _cameraController = controller;
-        _status = 'Camera ready';
         _initializingCamera = false;
+        _status = 'Camera ready';
       });
     } catch (e) {
-      if (!mounted) return;
       setState(() {
         _status = 'Camera init failed: $e';
         _initializingCamera = false;
       });
     }
+  }
+
+  @override
+  void dispose() {
+    _cameraController?.dispose();
+    _apiClient?.dispose();
+    _baseUrlCtrl.dispose();
+    _companyIdCtrl.dispose();
+    _adminCodeCtrl.dispose();
+    _adminPasswordCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _switchCamera() async {
+    if (_availableCameras.length < 2) return;
+
+    _currentLens = _currentLens == CameraLensDirection.front
+        ? CameraLensDirection.back
+        : CameraLensDirection.front;
+
+    await _cameraController?.dispose();
+    await _initCamera();
   }
 
   Future<Uint8List?> _captureFrameBytes() async {
@@ -94,10 +113,10 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
     if (_capturing) return null;
 
     _capturing = true;
+
     try {
       final file = await controller.takePicture();
-      final bytes = await file.readAsBytes();
-      return bytes;
+      return await file.readAsBytes();
     } catch (_) {
       return null;
     } finally {
@@ -107,6 +126,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
 
   Future<void> _login() async {
     if (_busy) return;
+
     final companyId = int.tryParse(_companyIdCtrl.text.trim());
     if (companyId == null) {
       setState(() => _status = 'Company ID must be a valid number.');
@@ -125,7 +145,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
         employeeCode: _adminCodeCtrl.text.trim(),
         password: _adminPasswordCtrl.text,
       );
-      if (!mounted) return;
+
       setState(() {
         _apiClient?.dispose();
         _apiClient = client;
@@ -133,164 +153,137 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
         _status = 'Login successful';
       });
     } catch (e) {
-      if (!mounted) return;
       setState(() => _status = 'Login failed: $e');
     } finally {
-      if (mounted) {
-        setState(() => _busy = false);
-      }
+      setState(() => _busy = false);
     }
   }
 
-  Future<void> _captureEnrollPhoto() async {
-    if (_busy) return;
-    final bytes = await _captureFrameBytes();
-    if (bytes == null || bytes.isEmpty) {
-      setState(() => _status = 'Unable to capture photo.');
-      return;
-    }
-    setState(() {
-      _enrollPhotos.add(bytes);
-      _status = 'Captured ${_enrollPhotos.length} enrollment photo(s).';
-    });
-  }
+  Future<void> _scanFaceForAttendance() async {
+    if (_busy || !_loggedIn || _apiClient == null) return;
 
-  void _clearEnrollPhotos() {
-    setState(() {
-      _enrollPhotos.clear();
-      _status = 'Enrollment photos cleared.';
-    });
-  }
-
-  Future<void> _createUserAndRegisterFace() async {
-    if (_busy) return;
-    if (!_loggedIn || _apiClient == null) {
-      setState(() => _status = 'Please login first.');
-      return;
-    }
-    final companyId = int.tryParse(_companyIdCtrl.text.trim());
-    if (companyId == null) {
-      setState(() => _status = 'Company ID must be a valid number.');
-      return;
-    }
-    if (_enrollPhotos.length < 3) {
-      setState(() => _status = 'Capture at least 3 photos before submitting.');
+    final firstFrame = await _captureFrameBytes();
+    if (firstFrame == null || firstFrame.isEmpty) {
+      setState(() => _attendanceStatus = 'Unable to capture frame.');
       return;
     }
 
     setState(() {
       _busy = true;
-      _status = 'Creating user and registering face...';
+      _attendanceStatus = 'Matching face in company...';
     });
 
     try {
-      final result = await _apiClient!.addUserWithPhotoRequired(
-        companyId: companyId,
-        name: _newNameCtrl.text.trim(),
-        employeeCode: _newEmployeeCodeCtrl.text.trim(),
-        password: _newPasswordCtrl.text,
-        photos: List<Uint8List>.from(_enrollPhotos),
-      );
+      Uint8List currentFrame = firstFrame;
+      Uint8List? previousFrame = _previousAttendanceFrame ?? firstFrame;
+      if (_previousAttendanceFrame == null) {
+        await Future<void>.delayed(const Duration(milliseconds: 120));
+        final secondFrame = await _captureFrameBytes();
+        if (secondFrame == null || secondFrame.isEmpty) {
+          setState(() => _attendanceStatus = 'Unable to capture second live frame.');
+          return;
+        }
+        previousFrame = firstFrame;
+        currentFrame = secondFrame;
+      }
 
-      if (!mounted) return;
+      final result = await _apiClient!.scanFaceForAttendance(
+        imageBytes: currentFrame,
+        previousImageBytes: previousFrame,
+        deviceId: 'flutter-attendance',
+        markAttendance: false,
+      );
+      _previousAttendanceFrame = currentFrame;
+
+      if (!result.verified || result.userId == null || result.name == null) {
+        setState(() {
+          _pendingMatch = null;
+          _approvalLabel = 'Approve Mark In';
+          _attendanceStatus = result.reason;
+        });
+        return;
+      }
+
+      final records = await _apiClient!.listAttendance(
+        date: DateTime.now().toUtc(),
+        userId: result.userId,
+      );
+      final currentStatus = records.isNotEmpty ? records.first.status.toLowerCase() : 'out';
+      final markOutNext = currentStatus == 'in' || currentStatus == 'present';
+
       setState(() {
-        _status =
-            'User created: id=${result.user.id}, face embeddings saved=${result.faceRegistration.embeddingsSaved}';
-        _verifyUserIdCtrl.text = result.user.id.toString();
-        _enrollPhotos.clear();
+        _pendingMatch = result;
+        _approvalLabel = markOutNext ? 'Approve Mark Out' : 'Approve Mark In';
+        _attendanceStatus =
+            'Matched: ${result.name} (id=${result.userId}) | conf=${result.confidence.toStringAsFixed(3)}';
       });
     } catch (e) {
-      if (!mounted) return;
-      setState(() => _status = 'Create/register failed: $e');
+      setState(() {
+        _pendingMatch = null;
+        _attendanceStatus = 'Attendance scan failed: $e';
+      });
     } finally {
-      if (mounted) {
-        setState(() => _busy = false);
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _approveAttendance() async {
+    final client = _apiClient;
+    final match = _pendingMatch;
+    if (_busy || !_loggedIn || client == null || match == null || match.userId == null) return;
+
+    setState(() {
+      _busy = true;
+      _attendanceStatus = 'Verifying live face before marking...';
+    });
+
+    try {
+      final firstFrame = await _captureFrameBytes();
+      if (firstFrame == null || firstFrame.isEmpty) {
+        setState(() => _attendanceStatus = 'Unable to capture frame for approval.');
+        return;
       }
-    }
-  }
 
-  Future<void> _startScan() async {
-    if (_scanning || _busy) return;
-    if (!_loggedIn || _apiClient == null) {
-      setState(() => _scanStatus = 'Please login first.');
-      return;
-    }
-    final companyId = int.tryParse(_companyIdCtrl.text.trim());
-    final userId = int.tryParse(_verifyUserIdCtrl.text.trim());
-    if (companyId == null || userId == null) {
-      setState(() => _scanStatus = 'Company ID and Verify User ID must be numbers.');
-      return;
-    }
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      final secondFrame = await _captureFrameBytes();
+      if (secondFrame == null || secondFrame.isEmpty) {
+        setState(() => _attendanceStatus = 'Unable to capture second frame for approval.');
+        return;
+      }
 
-    _scanner?.dispose();
-    _scanner = FaceVerificationScanner(
-      apiClient: _apiClient!,
-      companyId: companyId,
-      userId: userId,
-      captureFrameBytes: _captureFrameBytes,
-      onResult: (result) {
-        if (!mounted) return;
+      final approveScan = await client.scanFaceForAttendance(
+        imageBytes: secondFrame,
+        previousImageBytes: firstFrame,
+        deviceId: 'flutter-attendance-approve',
+        markAttendance: true,
+      );
+
+      if (
+          !approveScan.verified ||
+          approveScan.userId == null ||
+          approveScan.userId != match.userId ||
+          approveScan.attendance == null) {
         setState(() {
-          _scanStatus =
-              'verified=${result.verified} | conf=${result.confidence.toStringAsFixed(3)} | '
-              'liveness=${result.livenessScore.toStringAsFixed(3)} | reason=${result.reason}';
-          if (result.verified) {
-            _verifiedLocked = true;
-            _scanning = false;
-          }
+          _attendanceStatus = approveScan.reason;
         });
-      },
-      onError: (error, _) {
-        if (!mounted) return;
-        setState(() => _scanStatus = 'Scan error: $error');
-      },
-    );
+        return;
+      }
 
-    _scanner!.start();
-    setState(() {
-      _scanning = true;
-      _verifiedLocked = false;
-      _scanStatus = 'Scanning started...';
-    });
-  }
-
-  void _stopScan() {
-    _scanner?.stop();
-    setState(() {
-      _scanning = false;
-      _scanStatus = 'Scanning stopped.';
-    });
-  }
-
-  void _retryScan() {
-    final scanner = _scanner;
-    if (scanner == null) {
-      setState(() => _scanStatus = 'Start scanning first.');
-      return;
+      final marked = approveScan.attendance!;
+      final action = marked.action.replaceAll('_', ' ');
+      final status = marked.record.status;
+      setState(() {
+        _lastMarked = marked;
+        _pendingMatch = null;
+        _previousAttendanceFrame = secondFrame;
+        _approvalLabel = 'Approve Mark In';
+        _attendanceStatus = 'Marked: ${match.name} | $action | status=$status';
+      });
+    } catch (e) {
+      setState(() => _attendanceStatus = 'Approve failed: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
     }
-    scanner.retry();
-    setState(() {
-      _verifiedLocked = false;
-      _scanning = true;
-      _scanStatus = 'Retry started...';
-    });
-  }
-
-  @override
-  void dispose() {
-    _scanner?.dispose();
-    _apiClient?.dispose();
-    _cameraController?.dispose();
-
-    _baseUrlCtrl.dispose();
-    _companyIdCtrl.dispose();
-    _adminCodeCtrl.dispose();
-    _adminPasswordCtrl.dispose();
-    _newNameCtrl.dispose();
-    _newEmployeeCodeCtrl.dispose();
-    _newPasswordCtrl.dispose();
-    _verifyUserIdCtrl.dispose();
-    super.dispose();
   }
 
   @override
@@ -299,147 +292,136 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
     final cameraReady = controller != null && controller.value.isInitialized;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Face App Integration')),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            if (cameraReady)
-              AspectRatio(
-                aspectRatio: controller.value.aspectRatio,
-                child: CameraPreview(controller),
-              )
-            else
-              Container(
-                height: 220,
-                alignment: Alignment.center,
-                color: Colors.black12,
-                child: Text(_initializingCamera ? 'Loading camera...' : 'Camera not ready'),
+      appBar: AppBar(
+        title: const Text('Face App Integration'),
+        actions: [
+          if (cameraReady)
+            IconButton(
+              icon: const Icon(Icons.cameraswitch),
+              onPressed: _switchCamera,
+            ),
+        ],
+      ),
+      body: Column(
+        children: [
+          if (cameraReady)
+            AspectRatio(
+              aspectRatio: controller.value.aspectRatio,
+              child: CameraPreview(controller),
+            )
+          else
+            Container(
+              height: 220,
+              alignment: Alignment.center,
+              color: Colors.black12,
+              child: Text(
+                _initializingCamera
+                    ? 'Loading camera...'
+                    : 'Camera not available',
               ),
-            const SizedBox(height: 12),
-            Text(_status, style: const TextStyle(fontWeight: FontWeight.w600)),
-            const SizedBox(height: 12),
-            _sectionCard(
-              title: '1) Login',
+            ),
+
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(16),
               child: Column(
                 children: [
-                  TextField(
-                    controller: _baseUrlCtrl,
-                    decoration: const InputDecoration(labelText: 'Base URL'),
-                  ),
-                  TextField(
-                    controller: _companyIdCtrl,
-                    keyboardType: TextInputType.number,
-                    decoration: const InputDecoration(labelText: 'Company ID'),
-                  ),
-                  TextField(
-                    controller: _adminCodeCtrl,
-                    decoration: const InputDecoration(labelText: 'Admin Employee Code'),
-                  ),
-                  TextField(
-                    controller: _adminPasswordCtrl,
-                    obscureText: true,
-                    decoration: const InputDecoration(labelText: 'Admin Password'),
-                  ),
-                  const SizedBox(height: 10),
-                  ElevatedButton(
-                    onPressed: _busy ? null : _login,
-                    child: Text(_loggedIn ? 'Logged In' : 'Login'),
+                  _buildLoginSection(),
+                  const SizedBox(height: 12),
+                  _buildAttendanceSection(cameraReady),
+                  const SizedBox(height: 12),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text('Status: $_status'),
                   ),
                 ],
               ),
             ),
-            const SizedBox(height: 12),
-            _sectionCard(
-              title: '2) Add User + Face Photos',
-              child: Column(
-                children: [
-                  TextField(
-                    controller: _newNameCtrl,
-                    decoration: const InputDecoration(labelText: 'New User Name'),
-                  ),
-                  TextField(
-                    controller: _newEmployeeCodeCtrl,
-                    decoration: const InputDecoration(labelText: 'New User Employee Code'),
-                  ),
-                  TextField(
-                    controller: _newPasswordCtrl,
-                    obscureText: true,
-                    decoration: const InputDecoration(labelText: 'New User Password'),
-                  ),
-                  const SizedBox(height: 10),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: ElevatedButton(
-                          onPressed: _busy || !cameraReady ? null : _captureEnrollPhoto,
-                          child: const Text('Capture Photo'),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: OutlinedButton(
-                          onPressed: _busy ? null : _clearEnrollPhotos,
-                          child: const Text('Clear Photos'),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  Text('Captured photos: ${_enrollPhotos.length} (minimum 3 required)'),
-                  const SizedBox(height: 10),
-                  ElevatedButton(
-                    onPressed: _busy || !_loggedIn ? null : _createUserAndRegisterFace,
-                    child: const Text('Create User + Register Face'),
-                  ),
-                ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLoginSection() {
+    return _sectionCard(
+      title: '1) Login',
+      child: Column(
+        children: [
+          _input(_baseUrlCtrl, 'Base URL'),
+          _input(_companyIdCtrl, 'Company ID', type: TextInputType.number),
+          _input(_adminCodeCtrl, 'Admin Employee Code'),
+          _input(_adminPasswordCtrl, 'Admin Password', obscure: true),
+          const SizedBox(height: 10),
+          ElevatedButton(
+            onPressed: _busy ? null : _login,
+            child: Text(_loggedIn ? 'Logged In' : 'Login'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAttendanceSection(bool cameraReady) {
+    final match = _pendingMatch;
+    final canApprove = match != null && match.userId != null && !_busy && _loggedIn;
+
+    return _sectionCard(
+      title: '2) Attendance Approval Flow',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: ElevatedButton(
+                  onPressed: _busy || !_loggedIn || !cameraReady ? null : _scanFaceForAttendance,
+                  child: const Text('Scan Face (Match Only)'),
+                ),
               ),
-            ),
-            const SizedBox(height: 12),
-            _sectionCard(
-              title: '3) Verify User by Face Scan',
-              child: Column(
-                children: [
-                  TextField(
-                    controller: _verifyUserIdCtrl,
-                    keyboardType: TextInputType.number,
-                    decoration: const InputDecoration(labelText: 'Verify User ID'),
-                  ),
-                  const SizedBox(height: 10),
-                  Text(_scanStatus),
-                  const SizedBox(height: 10),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: ElevatedButton(
-                          onPressed: _busy || _scanning || _verifiedLocked || !cameraReady ? null : _startScan,
-                          child: const Text('Start Scan'),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: OutlinedButton(
-                          onPressed: !_scanning ? null : _stopScan,
-                          child: const Text('Stop'),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  ElevatedButton(
-                    onPressed: !_verifiedLocked ? null : _retryScan,
-                    child: const Text('Retry After Verified'),
-                  ),
-                  const SizedBox(height: 6),
-                  const Text(
-                    'After successful verification, scan stays stopped until Retry is pressed.',
-                    textAlign: TextAlign.center,
-                  ),
-                ],
-              ),
-            ),
-          ],
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(_attendanceStatus),
+          const SizedBox(height: 10),
+          if (match != null) Text('Matched User: ${match.name} (id=${match.userId})'),
+          if (_lastMarked != null) Text('Last Mark: ${_lastMarked!.action} -> ${_lastMarked!.record.status}'),
+          const SizedBox(height: 10),
+          ElevatedButton(
+            onPressed: canApprove ? _approveAttendance : null,
+            child: Text(_approvalLabel),
+          ),
+          OutlinedButton(
+            onPressed: _busy
+                ? null
+                : () => setState(() {
+                      _pendingMatch = null;
+                      _previousAttendanceFrame = null;
+                      _approvalLabel = 'Approve Mark In';
+                      _attendanceStatus = 'Pending match cleared.';
+                    }),
+            child: const Text('Clear Pending Match'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _input(
+    TextEditingController ctrl,
+    String label, {
+    bool obscure = false,
+    TextInputType type = TextInputType.text,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: TextField(
+        controller: ctrl,
+        obscureText: obscure,
+        keyboardType: type,
+        decoration: InputDecoration(
+          labelText: label,
+          border: const OutlineInputBorder(),
         ),
       ),
     );
@@ -447,13 +429,18 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
 
   Widget _sectionCard({required String title, required Widget child}) {
     return Card(
+      elevation: 4,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       child: Padding(
-        padding: const EdgeInsets.all(12),
+        padding: const EdgeInsets.all(16),
         child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
-            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Text(title,
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+            ),
+            const SizedBox(height: 12),
             child,
           ],
         ),

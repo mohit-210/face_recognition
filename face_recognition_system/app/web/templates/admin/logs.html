@@ -1,0 +1,49 @@
+{% extends "admin/base.html" %}
+{% block content %}
+<section class="dashboard-shell">
+  {% include "admin/sidebar.html" %}
+  <section class="module-board">
+    <article class="card module-card">
+      <h2>Verification Logs</h2>
+      <form method="post" action="/admin/logs/filter" class="row-form">
+        <select name="user_id">
+          <option value="">All users</option>
+          {% for u in users %}
+          <option value="{{ u.id }}" {% if selected_user_id == u.id %}selected{% endif %}>{{ u.name }}</option>
+          {% endfor %}
+        </select>
+        <input type="datetime-local" name="date" value="{{ selected_date }}" />
+        <button type="submit">Apply Filter</button>
+      </form>
+    </article>
+
+    <article class="card module-card">
+      <h2>Log Entries</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>User</th>
+            <th>Confidence</th>
+            <th>Liveness</th>
+            <th>Success</th>
+            <th>Device</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for log in logs %}
+          <tr>
+            <td>{{ log.timestamp }}</td>
+            <td>{{ log.user_id }}</td>
+            <td>{{ '%.4f' % log.confidence }}</td>
+            <td>{{ '%.4f' % log.liveness_score }}</td>
+            <td>{{ log.success }}</td>
+            <td>{{ log.device_id }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </article>
+  </section>
+</section>
+{% endblock %}

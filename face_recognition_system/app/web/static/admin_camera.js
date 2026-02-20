@@ -1,11 +1,16 @@
 let sharedStream = null;
-const monitorTimers = { register: null, verify: null };
-const readyStreak = { register: 0, verify: 0 };
-const lockStreak = { register: 0, verify: 0 };
-const lastCaptureAt = { register: 0, verify: 0 };
-const guidanceInFlight = { register: false, verify: false };
-const focusPoint = { register: { x: 0.5, y: 0.5 }, verify: { x: 0.5, y: 0.5 } };
+const monitorTimers = { register: null, verify: null, attendance: null };
+const readyStreak = { register: 0, verify: 0, attendance: 0 };
+const lockStreak = { register: 0, verify: 0, attendance: 0 };
+const lastCaptureAt = { register: 0, verify: 0, attendance: 0 };
+const guidanceInFlight = { register: false, verify: false, attendance: false };
+const focusPoint = {
+  register: { x: 0.5, y: 0.5 },
+  verify: { x: 0.5, y: 0.5 },
+  attendance: { x: 0.5, y: 0.5 },
+};
 let identifyInFlight = false;
+let attendancePreviousBlob = null;
 
 const MONITOR_INTERVAL_MS = 420;
 const READY_STREAK_REQUIRED = 1;
@@ -13,9 +18,12 @@ const LOCK_STREAK_REQUIRED = 2;
 const LOCK_SCORE_THRESHOLD = 0.70;
 const CAPTURE_COOLDOWN_MS = 1500;
 const VERIFY_IDENTIFY_INTERVAL_MS = 180;
+const ATTENDANCE_IDENTIFY_INTERVAL_MS = 400;
+const ATTENDANCE_SUCCESS_COOLDOWN_MS = 2500;
 const GUIDANCE_FRAME_MAX_WIDTH = 640;
 const GUIDANCE_FRAME_QUALITY = 0.82;
 const CAPTURE_FRAME_QUALITY = 0.9;
+let attendanceCooldownUntil = 0;
 
 async function ensureCameraStream() {
   if (sharedStream) return sharedStream;
@@ -34,11 +42,15 @@ async function ensureCameraStream() {
 }
 
 function getVideoByMode(mode) {
-  return document.getElementById(mode === "register" ? "register-video" : "verify-video");
+  if (mode === "register") return document.getElementById("register-video");
+  if (mode === "attendance") return document.getElementById("attendance-video");
+  return document.getElementById("verify-video");
 }
 
 function getCanvasByMode(mode) {
-  return document.getElementById(mode === "register" ? "register-overlay" : "verify-overlay");
+  if (mode === "register") return document.getElementById("register-overlay");
+  if (mode === "attendance") return document.getElementById("attendance-overlay");
+  return document.getElementById("verify-overlay");
 }
 
 function attachStreamToVideo(videoId, stream) {
@@ -207,6 +219,15 @@ function setVerifyResult(message, state = "") {
   if (state === "err") el.classList.add("err");
 }
 
+function setAttendanceResult(message, state = "") {
+  const el = document.getElementById("attendance-result");
+  if (!el) return;
+  el.textContent = `Result: ${message}`;
+  el.classList.remove("ok", "err");
+  if (state === "ok") el.classList.add("ok");
+  if (state === "err") el.classList.add("err");
+}
+
 function setFilesForInput(inputId, newFile, multiple) {
   const input = document.getElementById(inputId);
   if (!input) return;
@@ -280,6 +301,70 @@ async function identifyFromVideo() {
   }
 }
 
+async function attendanceFromVideo(manual = false) {
+  if (identifyInFlight) return false;
+  const now = Date.now();
+  if (!manual && now < attendanceCooldownUntil) {
+    const waitSec = Math.max(1, Math.ceil((attendanceCooldownUntil - now) / 1000));
+    setAttendanceResult(`cooldown active, next auto scan in ${waitSec}s`);
+    return false;
+  }
+
+  identifyInFlight = true;
+
+  try {
+    const blob = await captureBlobFromVideo("attendance-video", { maxWidth: 640, quality: 0.82 });
+    if (!blob) {
+      setAttendanceResult("camera is not ready", "err");
+      return false;
+    }
+    if (!attendancePreviousBlob) {
+      attendancePreviousBlob = blob;
+      setAttendanceResult("live check initializing, hold position and scan again");
+      return false;
+    }
+
+    const form = new FormData();
+    form.append("image", new File([blob], `attendance_${Date.now()}.jpg`, { type: "image/jpeg" }));
+    form.append(
+      "previous_image",
+      new File([attendancePreviousBlob], `attendance_prev_${Date.now()}.jpg`, { type: "image/jpeg" })
+    );
+    form.append("device_id", "admin-web-attendance");
+
+    const res = await fetch("/admin/attendance/scan", {
+      method: "POST",
+      body: form,
+      credentials: "same-origin",
+    });
+    if (!res.ok) {
+      setAttendanceResult("attendance request failed", "err");
+      return false;
+    }
+
+    const data = await res.json();
+    attendancePreviousBlob = blob;
+    if (data.verified && data.name && data.attendance) {
+      const action = String(data.attendance.action || "").replaceAll("_", " ");
+      const status = data.attendance.status || "";
+      attendanceCooldownUntil = Date.now() + ATTENDANCE_SUCCESS_COOLDOWN_MS;
+      setAttendanceResult(
+        `${data.name} | ${action} | status=${status} | waiting ${Math.round(ATTENDANCE_SUCCESS_COOLDOWN_MS / 1000)}s`,
+        "ok"
+      );
+      return true;
+    }
+
+    setAttendanceResult(data.reason || "Face not recognized", "err");
+    return false;
+  } catch {
+    setAttendanceResult("unable to contact attendance API", "err");
+    return false;
+  } finally {
+    identifyInFlight = false;
+  }
+}
+
 function evaluateLock(mode, data) {
   const isReady = Boolean(data.ready);
   const lockScore = Number(data.lock_score || 0);
@@ -299,7 +384,8 @@ async function requestFrameGuidance(mode) {
   if (guidanceInFlight[mode]) return;
   guidanceInFlight[mode] = true;
 
-  const videoId = mode === "register" ? "register-video" : "verify-video";
+  const video = getVideoByMode(mode);
+  const videoId = video ? video.id : "";
   syncOverlaySize(mode);
 
   const blob = await captureBlobFromVideo(videoId, {
@@ -341,7 +427,7 @@ async function requestFrameGuidance(mode) {
     setLockState(mode, isLocked ? "LOCKED" : "tracking", isLocked);
     drawFaceLock(mode, data.bbox, lockScore, data.frame_width, data.frame_height);
 
-    if (mode === "verify") return;
+    if (mode === "verify" || mode === "attendance") return;
 
     if (!isLocked) return;
 
@@ -386,7 +472,7 @@ function setFocusPointFromEvent(mode, event) {
 }
 
 function bindTapFocus() {
-  ["register", "verify"].forEach((mode) => {
+  ["register", "verify", "attendance"].forEach((mode) => {
     const canvas = getCanvasByMode(mode);
     if (!canvas) return;
     canvas.addEventListener("click", (event) => setFocusPointFromEvent(mode, event));
@@ -401,7 +487,7 @@ function bindTapFocus() {
 }
 
 async function startMonitoring(mode) {
-  const videoId = mode === "register" ? "register-video" : "verify-video";
+  const videoId = mode === "register" ? "register-video" : mode === "attendance" ? "attendance-video" : "verify-video";
   try {
     const stream = await ensureCameraStream();
     attachStreamToVideo(videoId, stream);
@@ -417,6 +503,11 @@ async function startMonitoring(mode) {
   if (mode === "verify") {
     setVerifyResult("scanning face...");
     setGuidance(mode, "Instant identify mode active.", true, 1, 0);
+    setLockState(mode, "instant", true);
+  }
+  if (mode === "attendance") {
+    setAttendanceResult("scanning for attendance...");
+    setGuidance(mode, "Auto attendance scan active.", true, 1, 0);
     setLockState(mode, "instant", true);
   }
 
@@ -439,6 +530,15 @@ async function startMonitoring(mode) {
     }, VERIFY_IDENTIFY_INTERVAL_MS);
     return;
   }
+  if (mode === "attendance") {
+    monitorTimers[mode] = setInterval(async () => {
+      const now = Date.now();
+      if (now - lastCaptureAt[mode] < ATTENDANCE_IDENTIFY_INTERVAL_MS) return;
+      lastCaptureAt[mode] = now;
+      await attendanceFromVideo(false);
+    }, ATTENDANCE_IDENTIFY_INTERVAL_MS);
+    return;
+  }
 
   monitorTimers[mode] = setInterval(() => {
     requestFrameGuidance(mode);
@@ -456,6 +556,9 @@ function stopMonitoring(mode) {
   setGuidance(mode, "Monitoring stopped.", false, 0, 0);
   setLockState(mode, "inactive", false);
   clearOverlay(mode);
+  if (mode === "attendance") {
+    attendancePreviousBlob = null;
+  }
 }
 
 function bindCameraActions() {
@@ -502,8 +605,15 @@ function bindCameraActions() {
     });
   }
 
+  const attendanceNow = document.getElementById("attendance-scan-now");
+  if (attendanceNow) {
+    attendanceNow.addEventListener("click", async () => {
+      await attendanceFromVideo(true);
+    });
+  }
+
   window.addEventListener("resize", () => {
-    ["register", "verify"].forEach((mode) => {
+    ["register", "verify", "attendance"].forEach((mode) => {
       syncOverlaySize(mode);
       if (monitorTimers[mode]) drawGuideFrame(mode);
     });

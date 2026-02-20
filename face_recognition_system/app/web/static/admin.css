@@ -26,9 +26,63 @@ body {
 }
 
 .container {
-  max-width: 1300px;
+  max-width: 1500px;
   margin: 18px auto;
   padding: 0 16px 20px;
+}
+
+.dashboard-shell {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.sidebar {
+  position: sticky;
+  top: 12px;
+  display: grid;
+  gap: 8px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px;
+}
+
+.sidebar h2 {
+  margin: 2px 0 8px;
+  font-size: 16px;
+}
+
+.sidebar a {
+  display: block;
+  text-decoration: none;
+  color: #0f172a;
+  background: #eef2ff;
+  border: 1px solid #dbe3ff;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.sidebar a:hover {
+  background: #dbeafe;
+}
+
+.sidebar a.active {
+  background: #0f766e;
+  color: #ffffff;
+  border-color: #0f766e;
+}
+
+.module-board {
+  display: grid;
+  gap: 14px;
+}
+
+.module-card {
+  scroll-margin-top: 14px;
 }
 
 .grid {
@@ -50,6 +104,33 @@ body {
 h1, h2 { margin: 0 0 10px; }
 h1 { font-size: 20px; }
 h2 { font-size: 18px; }
+h3 { margin: 0 0 10px; font-size: 16px; }
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.stat-item {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #f8fafc;
+  padding: 8px;
+  display: grid;
+  gap: 2px;
+}
+
+.stat-item span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.stat-item strong {
+  font-size: 18px;
+  color: #0f172a;
+}
 
 label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--muted); }
 .stack { display: grid; gap: 10px; }
@@ -127,6 +208,16 @@ button.danger { background: var(--danger); }
   flex-wrap: wrap;
 }
 
+.split-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.sub-card {
+  border-style: dashed;
+}
+
 .guidance {
   color: #0b4f4a;
   font-weight: 600;
@@ -172,6 +263,10 @@ th, td {
 }
 
 @media (max-width: 980px) {
+  .dashboard-shell { grid-template-columns: 1fr; }
+  .sidebar { position: static; }
+  .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .split-grid { grid-template-columns: 1fr; }
   .grid { grid-template-columns: 1fr; }
   .row-form, .inline-form, .camera-actions { flex-direction: column; }
 }

@@ -1,14 +1,16 @@
 ﻿from __future__ import annotations
 
 import base64
-from datetime import datetime
+import csv
+from datetime import date, datetime, timezone
+from io import StringIO
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
@@ -19,6 +21,7 @@ from app.database.session import get_db
 from app.models.user import User
 from app.repositories.user_repository import UserRepository
 from app.services.company_service import CompanyService
+from app.services.attendance_service import AttendanceService
 from app.services.face_service import FaceService
 from app.services.log_service import LogService
 from app.services.user_service import UserService
@@ -31,6 +34,18 @@ detector = FaceDetector()
 guidance_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
 router = APIRouter(prefix="/admin", tags=["Admin Panel"])
+
+_ATTENDANCE_REPORT_HEADERS = [
+    "attendance_date",
+    "user_id",
+    "employee_code",
+    "name",
+    "status",
+    "first_check_in_at",
+    "last_check_out_at",
+    "last_seen_at",
+    "verification_count",
+]
 
 
 class FaceLockManager:
@@ -78,6 +93,80 @@ def _redirect(path: str, msg: str = "", error: str = "") -> RedirectResponse:
         query.append(f"error={error}")
     suffix = "?" + "&".join(query) if query else ""
     return RedirectResponse(url=f"{path}{suffix}", status_code=303)
+
+
+def _attendance_rows(records, user_lookup: dict[int, User]) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for rec in records:
+        user = user_lookup.get(rec.user_id)
+        rows.append(
+            [
+                rec.attendance_date.isoformat(),
+                str(rec.user_id),
+                user.employee_code if user else "",
+                user.name if user else "",
+                rec.status,
+                rec.first_check_in_at.isoformat() if rec.first_check_in_at else "",
+                rec.last_check_out_at.isoformat() if rec.last_check_out_at else "",
+                rec.last_seen_at.isoformat() if rec.last_seen_at else "",
+                str(rec.verification_count),
+            ]
+        )
+    return rows
+
+
+def _attendance_summary(records) -> dict:
+    present = 0
+    checked_out = 0
+    total_scans = 0
+    for rec in records:
+        status = (rec.status or "").strip().lower()
+        if status in {"checked_out", "out"}:
+            checked_out += 1
+        else:
+            present += 1
+        total_scans += int(rec.verification_count or 0)
+    return {
+        "total_records": len(records),
+        "present": present,
+        "checked_out": checked_out,
+        "total_scans": total_scans,
+    }
+
+
+def _to_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _format_duration(seconds: int) -> str:
+    if seconds <= 0:
+        return "0m"
+    hours, rem = divmod(seconds, 3600)
+    minutes = rem // 60
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def _attendance_duration_label(record, now_utc: datetime) -> str:
+    check_in_at = _to_utc(record.first_check_in_at)
+    if check_in_at is None:
+        return "-"
+
+    status = (record.status or "").strip().lower()
+    check_out_at = _to_utc(record.last_check_out_at)
+    ongoing = status in {"in", "present"} and check_out_at is None
+    end_at = now_utc if ongoing else check_out_at
+    if end_at is None:
+        return "-"
+
+    seconds = max(0, int((end_at - check_in_at).total_seconds()))
+    label = _format_duration(seconds)
+    return f"{label} (ongoing)" if ongoing else label
 
 
 def _current_user_or_none(request: Request, db: Session) -> User | None:
@@ -339,7 +428,7 @@ def login_submit(
         return _redirect("/admin/login", error="Invalid credentials or inactive user")
 
     token = create_access_token(subject=user.employee_code, company_id=user.company_id)
-    response = _redirect("/admin", msg="Login successful")
+    response = _redirect("/admin/overview", msg="Login successful")
     response.set_cookie(
         key="admin_token",
         value=token,
@@ -401,47 +490,159 @@ def logout():
     return response
 
 
+def _build_admin_view_context(
+    request: Request,
+    db: Session,
+    current: User,
+    *,
+    selected_user_id: int | None = None,
+    selected_date: str = "",
+    selected_attendance_date: str = "",
+    include_logs: bool = False,
+    include_attendance: bool = False,
+) -> dict:
+    company_service = CompanyService(db)
+    user_service = UserService(db)
+    log_service = LogService(db)
+    attendance_service = AttendanceService(db)
+
+    companies = company_service.list_all()
+    users = user_service.list_by_company(current.company_id)
+    user_lookup = {u.id: u for u in users}
+
+    logs = []
+    if include_logs:
+        dt_filter = None
+        if selected_date:
+            try:
+                dt_filter = datetime.fromisoformat(selected_date)
+            except ValueError:
+                dt_filter = None
+        logs = log_service.list(company_id=current.company_id, user_id=selected_user_id, date=dt_filter)
+
+    attendance_records = []
+    attendance_view_rows = []
+    attendance_summary = {"total_records": 0, "present": 0, "checked_out": 0, "total_scans": 0}
+    if include_attendance:
+        attendance_filter = None
+        if selected_attendance_date:
+            try:
+                attendance_filter = date.fromisoformat(selected_attendance_date)
+            except ValueError:
+                attendance_filter = None
+        attendance_records = attendance_service.list(
+            company_id=current.company_id,
+            attendance_date=attendance_filter,
+            user_id=selected_user_id,
+        )
+        now_utc = datetime.now(timezone.utc)
+        attendance_view_rows = [
+            {
+                "record": rec,
+                "user": user_lookup.get(rec.user_id),
+                "duration_label": _attendance_duration_label(rec, now_utc),
+            }
+            for rec in attendance_records
+        ]
+        attendance_summary = _attendance_summary(attendance_records)
+
+    return {
+        "current_user": current,
+        "companies": companies,
+        "users": users,
+        "logs": logs,
+        "attendance_records": attendance_records,
+        "attendance_view_rows": attendance_view_rows,
+        "attendance_summary": attendance_summary,
+        "user_lookup": user_lookup,
+        "selected_user_id": selected_user_id,
+        "selected_date": selected_date,
+        "selected_attendance_date": selected_attendance_date,
+        "msg": request.query_params.get("msg", ""),
+        "error": request.query_params.get("error", ""),
+    }
+
+
 @router.get("", response_class=HTMLResponse)
-def admin_home(
+def admin_home(request: Request, db: Session = Depends(get_db)):
+    current = _current_user_or_none(request, db)
+    if not current:
+        return RedirectResponse(url="/admin/login", status_code=303)
+    return RedirectResponse(url="/admin/overview", status_code=303)
+
+
+@router.get("/overview", response_class=HTMLResponse)
+def admin_overview(request: Request, db: Session = Depends(get_db)):
+    current = _current_user_or_none(request, db)
+    if not current:
+        return RedirectResponse(url="/admin/login", status_code=303)
+    context = _build_admin_view_context(request, db, current, include_logs=True, include_attendance=True)
+    context["active_page"] = "overview"
+    return templates.TemplateResponse(request, "admin/overview.html", context)
+
+
+@router.get("/users", response_class=HTMLResponse)
+def admin_users(request: Request, db: Session = Depends(get_db)):
+    current = _current_user_or_none(request, db)
+    if not current:
+        return RedirectResponse(url="/admin/login", status_code=303)
+    context = _build_admin_view_context(request, db, current)
+    context["active_page"] = "users"
+    return templates.TemplateResponse(request, "admin/users.html", context)
+
+
+@router.get("/face", response_class=HTMLResponse)
+def admin_face(request: Request, db: Session = Depends(get_db)):
+    current = _current_user_or_none(request, db)
+    if not current:
+        return RedirectResponse(url="/admin/login", status_code=303)
+    context = _build_admin_view_context(request, db, current)
+    context["active_page"] = "face"
+    return templates.TemplateResponse(request, "admin/face.html", context)
+
+
+@router.get("/attendance", response_class=HTMLResponse)
+def admin_attendance(
     request: Request,
     user_id: int | None = None,
-    date: str | None = None,
+    attendance_date: str = "",
     db: Session = Depends(get_db),
 ):
     current = _current_user_or_none(request, db)
     if not current:
         return RedirectResponse(url="/admin/login", status_code=303)
-
-    company_service = CompanyService(db)
-    user_service = UserService(db)
-    log_service = LogService(db)
-
-    companies = company_service.list_all()
-    users = user_service.list_by_company(current.company_id)
-
-    date_filter = None
-    if date:
-        try:
-            date_filter = datetime.fromisoformat(date)
-        except ValueError:
-            date_filter = None
-
-    logs = log_service.list(company_id=current.company_id, user_id=user_id, date=date_filter)
-
-    return templates.TemplateResponse(
+    context = _build_admin_view_context(
         request,
-        "admin/dashboard.html",
-        {
-            "current_user": current,
-            "companies": companies,
-            "users": users,
-            "logs": logs,
-            "msg": request.query_params.get("msg", ""),
-            "error": request.query_params.get("error", ""),
-            "selected_user_id": user_id,
-            "selected_date": date or "",
-        },
+        db,
+        current,
+        selected_user_id=user_id,
+        selected_attendance_date=attendance_date,
+        include_attendance=True,
     )
+    context["active_page"] = "attendance"
+    return templates.TemplateResponse(request, "admin/attendance.html", context)
+
+
+@router.get("/logs", response_class=HTMLResponse)
+def admin_logs(
+    request: Request,
+    user_id: int | None = None,
+    date: str = "",
+    db: Session = Depends(get_db),
+):
+    current = _current_user_or_none(request, db)
+    if not current:
+        return RedirectResponse(url="/admin/login", status_code=303)
+    context = _build_admin_view_context(
+        request,
+        db,
+        current,
+        selected_user_id=user_id,
+        selected_date=date,
+        include_logs=True,
+    )
+    context["active_page"] = "logs"
+    return templates.TemplateResponse(request, "admin/logs.html", context)
 
 
 @router.post("/company/create")
@@ -449,9 +650,9 @@ def create_company(request: Request, name: str = Form(...), db: Session = Depend
     _require_admin(request, db)
     try:
         CompanyService(db).create(name=name.strip())
-        return _redirect("/admin", msg="Company created")
+        return _redirect("/admin/overview", msg="Company created")
     except HTTPException as exc:
-        return _redirect("/admin", error=str(exc.detail))
+        return _redirect("/admin/overview", error=str(exc.detail))
 
 
 @router.post("/users/create")
@@ -470,9 +671,9 @@ def create_user(
             employee_code=employee_code.strip(),
             password=password,
         )
-        return _redirect("/admin", msg="User created")
+        return _redirect("/admin/users", msg="User created")
     except HTTPException as exc:
-        return _redirect("/admin", error=str(exc.detail))
+        return _redirect("/admin/users", error=str(exc.detail))
 
 
 @router.post("/users/{user_id}/update")
@@ -488,7 +689,7 @@ def update_user(
     service = UserService(db)
     user = service.get(user_id)
     if user.company_id != current.company_id:
-        return _redirect("/admin", error="Cross-company update denied")
+        return _redirect("/admin/users", error="Cross-company update denied")
 
     try:
         service.update(
@@ -497,9 +698,9 @@ def update_user(
             status=status,
             password=password.strip() or None,
         )
-        return _redirect("/admin", msg="User updated")
+        return _redirect("/admin/users", msg="User updated")
     except HTTPException as exc:
-        return _redirect("/admin", error=str(exc.detail))
+        return _redirect("/admin/users", error=str(exc.detail))
 
 
 @router.post("/users/{user_id}/delete")
@@ -508,10 +709,10 @@ def delete_user(user_id: int, request: Request, db: Session = Depends(get_db)):
     service = UserService(db)
     user = service.get(user_id)
     if user.company_id != current.company_id:
-        return _redirect("/admin", error="Cross-company delete denied")
+        return _redirect("/admin/users", error="Cross-company delete denied")
 
     service.delete(user_id)
-    return _redirect("/admin", msg="User deleted")
+    return _redirect("/admin/users", msg="User deleted")
 
 
 @router.post("/users/{user_id}/toggle")
@@ -520,11 +721,11 @@ def toggle_user(user_id: int, request: Request, db: Session = Depends(get_db)):
     service = UserService(db)
     user = service.get(user_id)
     if user.company_id != current.company_id:
-        return _redirect("/admin", error="Cross-company toggle denied")
+        return _redirect("/admin/users", error="Cross-company toggle denied")
 
     new_status = "inactive" if user.status == "active" else "active"
     service.update(user_id=user_id, name=user.name, status=new_status, password=None)
-    return _redirect("/admin", msg=f"User {new_status}")
+    return _redirect("/admin/users", msg=f"User {new_status}")
 
 
 @router.post("/face/register")
@@ -537,14 +738,14 @@ def register_face(
     current = _require_admin(request, db)
     user = UserService(db).get(user_id)
     if user.company_id != current.company_id:
-        return _redirect("/admin", error="Cross-company face registration denied")
+        return _redirect("/admin/face", error="Cross-company face registration denied")
 
     try:
         image_payloads = [_image_to_base64(file) for file in images]
         saved = FaceService(db).register_embeddings(user_id=user_id, images_base64=image_payloads)
-        return _redirect("/admin", msg=f"Face embeddings saved: {saved}")
+        return _redirect("/admin/face", msg=f"Face embeddings saved: {saved}")
     except HTTPException as exc:
-        return _redirect("/admin", error=str(exc.detail))
+        return _redirect("/admin/face", error=str(exc.detail))
 
 
 @router.post("/face/verify")
@@ -561,14 +762,14 @@ def verify_face(
     current = _require_admin(request, db)
     user = UserService(db).get(user_id)
     if user.company_id != current.company_id:
-        return _redirect("/admin", error="Cross-company verification denied")
+        return _redirect("/admin/face", error="Cross-company verification denied")
 
     try:
         lock_mgr = _get_lock_manager(current.id)
         frame = _decode_upload_image(image)
         guide = _frame_guidance(frame, lock_mgr, update_state=False)
         if not guide.get("ready", False):
-            return _redirect("/admin", error=f"Alignment lost: {guide.get('guidance', 'Face not stable')}")
+            return _redirect("/admin/face", error=f"Alignment lost: {guide.get('guidance', 'Face not stable')}")
 
         image_b64 = _image_to_base64(image)
         previous_b64 = _image_to_base64(previous_image) if previous_image else None
@@ -586,9 +787,9 @@ def verify_face(
             f"{verdict} | conf={result['confidence']:.4f} | "
             f"liveness={result['liveness_score']:.4f} | reason={result['reason']}"
         )
-        return _redirect("/admin", msg=message)
+        return _redirect("/admin/face", msg=message)
     except HTTPException as exc:
-        return _redirect("/admin", error=str(exc.detail))
+        return _redirect("/admin/face", error=str(exc.detail))
 
 
 @router.post("/face/identify")
@@ -637,4 +838,185 @@ def filter_logs(user_id: int | None = Form(default=None), date: str = Form(defau
     if date.strip():
         query.append(f"date={date.strip()}")
     suffix = "?" + "&".join(query) if query else ""
-    return RedirectResponse(url=f"/admin{suffix}", status_code=303)
+    return RedirectResponse(url=f"/admin/logs{suffix}", status_code=303)
+
+
+@router.post("/attendance/{user_id}/checkout")
+def admin_manual_checkout(user_id: int, request: Request, db: Session = Depends(get_db)):
+    current = _require_admin(request, db)
+    try:
+        AttendanceService(db).checkout(company_id=current.company_id, user_id=user_id)
+        return _redirect("/admin/attendance", msg="Manual checkout completed")
+    except HTTPException as exc:
+        return _redirect("/admin/attendance", error=str(exc.detail))
+
+
+@router.post("/attendance/scan")
+def admin_attendance_scan(
+    request: Request,
+    image: UploadFile = File(...),
+    previous_image: UploadFile | None = File(default=None),
+    device_id: str = Form(default="admin-web-attendance"),
+    db: Session = Depends(get_db),
+):
+    current = _require_admin(request, db)
+    image_b64 = _image_to_base64(image)
+    previous_b64 = _image_to_base64(previous_image) if previous_image else None
+    identified = FaceService(db).identify_in_company(
+        company_id=current.company_id,
+        image_base64=image_b64,
+        device_id=device_id.strip() or None,
+        enforce_liveness=True,
+        previous_image_base64=previous_b64,
+        require_live_motion=True,
+    )
+    if not identified.get("verified") or identified.get("user_id") is None:
+        return identified
+
+    marked = AttendanceService(db).mark_verified_face(
+        company_id=current.company_id,
+        user_id=int(identified["user_id"]),
+    )
+    return {
+        **identified,
+        "attendance": {
+            "action": marked["action"],
+            "status": marked["record"].status,
+            "attendance_date": str(marked["record"].attendance_date),
+        },
+    }
+
+
+@router.get("/attendance/report")
+def attendance_report_download(
+    request: Request,
+    user_id: int | None = None,
+    attendance_date: str = "",
+    fmt: str = "csv",
+    db: Session = Depends(get_db),
+):
+    current = _require_admin(request, db)
+
+    attendance_filter = None
+    if attendance_date:
+        try:
+            attendance_filter = date.fromisoformat(attendance_date)
+        except ValueError:
+            attendance_filter = None
+
+    records = AttendanceService(db).list(
+        company_id=current.company_id,
+        attendance_date=attendance_filter,
+        user_id=user_id,
+    )
+    users = UserService(db).list_by_company(current.company_id)
+    user_lookup = {u.id: u for u in users}
+    rows = _attendance_rows(records, user_lookup)
+    summary = _attendance_summary(records)
+    file_date = attendance_filter.isoformat() if attendance_filter else "all"
+    fmt_clean = fmt.strip().lower()
+    base_name = f"attendance_report_company_{current.company_id}_{file_date}"
+
+    if fmt_clean == "xlsx":
+        try:
+            from openpyxl import Workbook
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"XLSX export not available: {exc}") from exc
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Attendance"
+        ws.append(_ATTENDANCE_REPORT_HEADERS)
+        for row in rows:
+            ws.append(row)
+        ws.append([])
+        ws.append(["summary_total_records", str(summary["total_records"])])
+        ws.append(["summary_present", str(summary["present"])])
+        ws.append(["summary_checked_out", str(summary["checked_out"])])
+        ws.append(["summary_total_scans", str(summary["total_scans"])])
+
+        # openpyxl requires binary stream for download.
+        from io import BytesIO
+
+        binary = BytesIO()
+        wb.save(binary)
+        binary.seek(0)
+        return StreamingResponse(
+            binary,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{base_name}.xlsx"'},
+        )
+
+    if fmt_clean == "pdf":
+        try:
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib.units import mm
+            from reportlab.pdfgen import canvas
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"PDF export not available: {exc}") from exc
+
+        from io import BytesIO
+
+        pdf_io = BytesIO()
+        c = canvas.Canvas(pdf_io, pagesize=A4)
+        width, height = A4
+        y = height - 15 * mm
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(15 * mm, y, f"Attendance Report - Company {current.company_id}")
+        y -= 8 * mm
+        c.setFont("Helvetica", 9)
+        c.drawString(
+            15 * mm,
+            y,
+            (
+                f"Date filter: {file_date} | Records: {summary['total_records']} | Present: {summary['present']} | "
+                f"Checked-out: {summary['checked_out']} | Scans: {summary['total_scans']}"
+            ),
+        )
+        y -= 8 * mm
+
+        c.setFont("Helvetica-Bold", 8)
+        c.drawString(15 * mm, y, "Date")
+        c.drawString(45 * mm, y, "Code")
+        c.drawString(72 * mm, y, "Name")
+        c.drawString(120 * mm, y, "Status")
+        c.drawString(145 * mm, y, "Scans")
+        y -= 5 * mm
+        c.setFont("Helvetica", 8)
+        for row in rows:
+            if y < 15 * mm:
+                c.showPage()
+                y = height - 15 * mm
+                c.setFont("Helvetica", 8)
+            c.drawString(15 * mm, y, row[0][:10])
+            c.drawString(45 * mm, y, row[2][:18])
+            c.drawString(72 * mm, y, row[3][:30])
+            c.drawString(120 * mm, y, row[4][:12])
+            c.drawString(145 * mm, y, row[8][:6])
+            y -= 5 * mm
+
+        c.save()
+        pdf_io.seek(0)
+        return StreamingResponse(
+            pdf_io,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{base_name}.pdf"'},
+        )
+
+    # default CSV
+    buffer = StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(_ATTENDANCE_REPORT_HEADERS)
+    for row in rows:
+        writer.writerow(row)
+    writer.writerow([])
+    writer.writerow(["summary_total_records", summary["total_records"]])
+    writer.writerow(["summary_present", summary["present"]])
+    writer.writerow(["summary_checked_out", summary["checked_out"]])
+    writer.writerow(["summary_total_scans", summary["total_scans"]])
+    buffer.seek(0)
+    return StreamingResponse(
+        iter([buffer.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{base_name}.csv"'},
+    )
