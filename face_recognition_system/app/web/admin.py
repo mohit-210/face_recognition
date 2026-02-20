@@ -868,7 +868,7 @@ def admin_attendance_scan(
         device_id=device_id.strip() or None,
         enforce_liveness=True,
         previous_image_base64=previous_b64,
-        require_live_motion=True,
+        require_live_motion=False,
     )
     if not identified.get("verified") or identified.get("user_id") is None:
         return identified

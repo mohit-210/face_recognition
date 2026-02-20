@@ -31,7 +31,7 @@ def scan_face_for_attendance(
         device_id=payload.device_id,
         enforce_liveness=True,
         previous_image_base64=payload.previous_image_base64,
-        require_live_motion=True,
+        require_live_motion=False,
     )
     attendance = None
     if payload.mark_attendance and identified.get("verified") and identified.get("user_id") is not None:
@@ -61,18 +61,28 @@ def scan_face_burst_for_attendance(
     face_service = FaceService(db)
     attempts: list[dict] = []
     previous_image_base64: str | None = None
+    min_verified_samples = max(1, int(payload.min_verified_samples))
+    min_consensus_ratio = float(payload.min_consensus_ratio)
+    total_samples = len(payload.images_base64)
+    verified_so_far = 0
 
-    for image_base64 in payload.images_base64:
+    for idx, image_base64 in enumerate(payload.images_base64):
         result = face_service.identify_in_company(
             company_id=current_user.company_id,
             image_base64=image_base64,
             device_id=payload.device_id,
             enforce_liveness=True,
             previous_image_base64=previous_image_base64,
-            require_live_motion=True,
+            require_live_motion=False,
         )
         attempts.append(result)
+        if result.get("verified") and result.get("user_id") is not None:
+            verified_so_far += 1
         previous_image_base64 = image_base64
+
+        remaining = total_samples - (idx + 1)
+        if verified_so_far + remaining < min_verified_samples:
+            break
 
     verified_attempts = [r for r in attempts if r.get("verified") and r.get("user_id") is not None]
     total_samples = len(attempts)
@@ -97,9 +107,7 @@ def scan_face_burst_for_attendance(
 
     user_counts = Counter(int(r["user_id"]) for r in verified_attempts)
     consensus_user_id, user_hit_count = user_counts.most_common(1)[0]
-    consensus_ratio = float(user_hit_count / float(total_samples))
-    min_verified_samples = max(1, int(payload.min_verified_samples))
-    min_consensus_ratio = float(payload.min_consensus_ratio)
+    consensus_ratio = float(user_hit_count / float(verified_samples))
 
     if verified_samples < min_verified_samples or consensus_ratio < min_consensus_ratio:
         return AttendanceScanResponse(

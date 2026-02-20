@@ -19,6 +19,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
   CameraController? _cameraController;
   List<CameraDescription> _availableCameras = [];
   CameraLensDirection _currentLens = CameraLensDirection.front;
+  String _captureQuality = 'medium';
 
   FaceApiClient? _apiClient;
 
@@ -29,11 +30,11 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
 
   String _status = 'Ready';
   String _attendanceStatus = 'No face matched yet.';
-  String _approvalLabel = 'Approve Mark In';
+  String _approvalLabel = 'Approve Attendance';
   AttendanceScanResponse? _pendingMatch;
   AttendanceMarkRead? _lastMarked;
-  static const int _attendanceBurstFrames = 3;
-  static const Duration _attendanceBurstGap = Duration(milliseconds: 120);
+  static const int _attendanceBurstFrames = 2;
+  static const Duration _attendanceBurstGap = Duration(milliseconds: 70);
 
   @override
   void initState() {
@@ -65,7 +66,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
 
       final controller = CameraController(
         selected,
-        ResolutionPreset.low,
+        _resolutionPresetForQuality(_captureQuality),
         enableAudio: false,
       );
 
@@ -104,6 +105,27 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
         ? CameraLensDirection.back
         : CameraLensDirection.front;
 
+    await _cameraController?.dispose();
+    await _initCamera();
+  }
+
+  ResolutionPreset _resolutionPresetForQuality(String quality) {
+    switch (quality) {
+      case 'low':
+        return ResolutionPreset.low;
+      case 'high':
+        return ResolutionPreset.high;
+      default:
+        return ResolutionPreset.medium;
+    }
+  }
+
+  Future<void> _setCaptureQuality(String quality) async {
+    if (_captureQuality == quality) return;
+    setState(() {
+      _captureQuality = quality;
+      _status = 'Applying camera quality: $quality...';
+    });
     await _cameraController?.dispose();
     await _initCamera();
   }
@@ -197,38 +219,32 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
         imageBytesBurst: frames,
         deviceId: 'flutter-attendance',
         markAttendance: false,
-        minVerifiedSamples: 2,
-        minConsensusRatio: 0.67,
+        minVerifiedSamples: 1,
+        minConsensusRatio: 0.60,
       );
 
       if (!result.verified || result.userId == null || result.name == null) {
         setState(() {
           _pendingMatch = null;
-          _approvalLabel = 'Approve Mark In';
+          _approvalLabel = 'Approve Attendance';
           _attendanceStatus = result.reason;
         });
         return;
       }
 
-      final records = await _apiClient!.listAttendance(
-        date: DateTime.now().toUtc(),
-        userId: result.userId,
-      );
-      final currentStatus = records.isNotEmpty ? records.first.status.toLowerCase() : 'out';
-      final markOutNext = currentStatus == 'in' || currentStatus == 'present';
-
       setState(() {
         _pendingMatch = result;
-        _approvalLabel = markOutNext ? 'Approve Mark Out' : 'Approve Mark In';
+        _approvalLabel = 'Approve Attendance';
         _attendanceStatus =
             'Matched: ${result.name} (id=${result.userId}) | conf=${result.confidence.toStringAsFixed(3)}'
             ' | live=${result.livenessScore.toStringAsFixed(3)}'
-            ' | consensus=${(100 * (result.consensusRatio ?? 0)).toStringAsFixed(0)}%';
+            ' | consensus=${(100 * (result.consensusRatio ?? 0)).toStringAsFixed(0)}%'
+            ' | samples=${result.samplesVerified ?? 0}/${result.samplesEvaluated ?? 0}';
       });
     } catch (e) {
       setState(() {
         _pendingMatch = null;
-        _attendanceStatus = 'Attendance scan failed: $e';
+        _attendanceStatus = 'Attendance scan failed: ${_readableError(e)}';
       });
     } finally {
       if (mounted) setState(() => _busy = false);
@@ -256,8 +272,8 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
         imageBytesBurst: frames,
         deviceId: 'flutter-attendance-approve',
         markAttendance: true,
-        minVerifiedSamples: 2,
-        minConsensusRatio: 0.67,
+        minVerifiedSamples: 1,
+        minConsensusRatio: 0.60,
       );
 
       if (
@@ -277,17 +293,23 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
       setState(() {
         _lastMarked = marked;
         _pendingMatch = null;
-        _approvalLabel = 'Approve Mark In';
+        _approvalLabel = 'Approve Attendance';
         _attendanceStatus =
             'Marked: ${match.name} | $action | status=$status'
             ' | conf=${approveScan.confidence.toStringAsFixed(3)}'
-            ' | consensus=${(100 * (approveScan.consensusRatio ?? 0)).toStringAsFixed(0)}%';
+            ' | consensus=${(100 * (approveScan.consensusRatio ?? 0)).toStringAsFixed(0)}%'
+            ' | samples=${approveScan.samplesVerified ?? 0}/${approveScan.samplesEvaluated ?? 0}';
       });
     } catch (e) {
-      setState(() => _attendanceStatus = 'Approve failed: $e');
+      setState(() => _attendanceStatus = 'Approve failed: ${_readableError(e)}');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
+  }
+
+  String _readableError(Object error) {
+    if (error is FaceApiException) return error.message;
+    return error.toString();
   }
 
   @override
@@ -299,6 +321,15 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
       appBar: AppBar(
         title: const Text('Face App Integration'),
         actions: [
+          PopupMenuButton<String>(
+            onSelected: (value) => _setCaptureQuality(value),
+            itemBuilder: (context) => const [
+              PopupMenuItem(value: 'low', child: Text('Quality: Low')),
+              PopupMenuItem(value: 'medium', child: Text('Quality: Medium')),
+              PopupMenuItem(value: 'high', child: Text('Quality: High')),
+            ],
+            icon: const Icon(Icons.high_quality),
+          ),
           if (cameraReady)
             IconButton(
               icon: const Icon(Icons.cameraswitch),
@@ -336,7 +367,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
                   const SizedBox(height: 12),
                   Align(
                     alignment: Alignment.centerLeft,
-                    child: Text('Status: $_status'),
+                    child: Text('Status: $_status | Camera quality: $_captureQuality'),
                   ),
                 ],
               ),
@@ -400,7 +431,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
                 ? null
                 : () => setState(() {
                       _pendingMatch = null;
-                      _approvalLabel = 'Approve Mark In';
+                      _approvalLabel = 'Approve Attendance';
                       _attendanceStatus = 'Pending match cleared.';
                     }),
             child: const Text('Clear Pending Match'),

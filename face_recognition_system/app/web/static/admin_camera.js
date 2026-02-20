@@ -11,6 +11,8 @@ const focusPoint = {
 };
 let identifyInFlight = false;
 let attendancePreviousBlob = null;
+let lastAttendanceResultMessage = "waiting for scan";
+let lastAttendanceResultState = "";
 
 const MONITOR_INTERVAL_MS = 420;
 const READY_STREAK_REQUIRED = 1;
@@ -220,12 +222,23 @@ function setVerifyResult(message, state = "") {
 }
 
 function setAttendanceResult(message, state = "") {
+  lastAttendanceResultMessage = String(message || "").trim() || "waiting for scan";
+  lastAttendanceResultState = state;
+  renderAttendanceResult();
+}
+
+function renderAttendanceResult(cooldownSeconds = 0) {
   const el = document.getElementById("attendance-result");
   if (!el) return;
-  el.textContent = `Result: ${message}`;
+  const suffix = cooldownSeconds > 0 ? ` | next auto scan in ${cooldownSeconds}s` : "";
+  el.textContent = `Result: ${lastAttendanceResultMessage}${suffix}`;
   el.classList.remove("ok", "err");
-  if (state === "ok") el.classList.add("ok");
-  if (state === "err") el.classList.add("err");
+  if (lastAttendanceResultState === "ok") el.classList.add("ok");
+  if (lastAttendanceResultState === "err") el.classList.add("err");
+}
+
+function setAttendanceCooldown(seconds) {
+  renderAttendanceResult(Math.max(0, Number(seconds) || 0));
 }
 
 function setFilesForInput(inputId, newFile, multiple) {
@@ -306,7 +319,7 @@ async function attendanceFromVideo(manual = false) {
   const now = Date.now();
   if (!manual && now < attendanceCooldownUntil) {
     const waitSec = Math.max(1, Math.ceil((attendanceCooldownUntil - now) / 1000));
-    setAttendanceResult(`cooldown active, next auto scan in ${waitSec}s`);
+    setAttendanceCooldown(waitSec);
     return false;
   }
 
@@ -348,10 +361,8 @@ async function attendanceFromVideo(manual = false) {
       const action = String(data.attendance.action || "").replaceAll("_", " ");
       const status = data.attendance.status || "";
       attendanceCooldownUntil = Date.now() + ATTENDANCE_SUCCESS_COOLDOWN_MS;
-      setAttendanceResult(
-        `${data.name} | ${action} | status=${status} | waiting ${Math.round(ATTENDANCE_SUCCESS_COOLDOWN_MS / 1000)}s`,
-        "ok"
-      );
+      setAttendanceResult(`${data.name} | ${action} | status=${status}`, "ok");
+      setAttendanceCooldown(Math.round(ATTENDANCE_SUCCESS_COOLDOWN_MS / 1000));
       return true;
     }
 

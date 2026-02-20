@@ -1,0 +1,6 @@
+{
+  "threshold_eer": 0.47942471504211426,
+  "eer": 0.7847222222222222,
+  "score_bias": 0.0,
+  "notes": "Use threshold_eer as baseline. Tune attendance threshold from real deployment ROC."
+}

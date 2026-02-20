@@ -371,8 +371,8 @@ class FaceApiClient {
     required List<Uint8List> imageBytesBurst,
     String? deviceId,
     bool markAttendance = true,
-    int minVerifiedSamples = 2,
-    double minConsensusRatio = 0.67,
+    int minVerifiedSamples = 1,
+    double minConsensusRatio = 0.60,
   }) async {
     if (imageBytesBurst.length < 2) {
       throw FaceApiException('At least 2 frames are required for burst attendance scan.');

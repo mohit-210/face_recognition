@@ -35,8 +35,8 @@ class AttendanceBurstScanRequest(BaseModel):
     images_base64: list[str] = Field(min_length=2, max_length=5)
     device_id: str | None = None
     mark_attendance: bool = True
-    min_verified_samples: int = Field(default=2, ge=1, le=5)
-    min_consensus_ratio: float = Field(default=0.67, ge=0.5, le=1.0)
+    min_verified_samples: int = Field(default=1, ge=1, le=5)
+    min_consensus_ratio: float = Field(default=0.60, ge=0.5, le=1.0)
 
 
 class AttendanceScanResponse(BaseModel):

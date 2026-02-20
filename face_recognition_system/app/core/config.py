@@ -23,9 +23,14 @@ class Settings(BaseSettings):
 
     recognition_threshold: float = Field(default=0.45, ge=0.0, le=1.0)
     liveness_threshold: float = Field(default=0.65, ge=0.0, le=1.0)
-    attendance_liveness_threshold: float = Field(default=0.48, ge=0.0, le=1.0)
+    attendance_liveness_threshold: float = Field(default=0.40, ge=0.0, le=1.0)
     attendance_min_motion_diff: float = Field(default=1.6, ge=0.1, le=20.0)
     attendance_auto_checkout_after_minutes: int = Field(default=480, ge=1, le=1440)
+    passive_antispoof_model_path: str = "./models/passive_antispoof_mini_fasnet.keras"
+    passive_antispoof_calibration_path: str = "./models/passive_antispoof_calibration.json"
+    passive_blur_min_variance: float = Field(default=32.0, ge=1.0, le=5000.0)
+    passive_lighting_min: float = Field(default=55.0, ge=0.0, le=255.0)
+    passive_lighting_max: float = Field(default=205.0, ge=0.0, le=255.0)
 
     model_path: str = "./models"
 
