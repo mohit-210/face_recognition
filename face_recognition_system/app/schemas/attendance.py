@@ -1,6 +1,6 @@
 from datetime import date, datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class AttendanceRead(BaseModel):
@@ -31,6 +31,14 @@ class AttendanceScanRequest(BaseModel):
     mark_attendance: bool = True
 
 
+class AttendanceBurstScanRequest(BaseModel):
+    images_base64: list[str] = Field(min_length=2, max_length=5)
+    device_id: str | None = None
+    mark_attendance: bool = True
+    min_verified_samples: int = Field(default=2, ge=1, le=5)
+    min_consensus_ratio: float = Field(default=0.67, ge=0.5, le=1.0)
+
+
 class AttendanceScanResponse(BaseModel):
     verified: bool
     user_id: int | None
@@ -39,3 +47,6 @@ class AttendanceScanResponse(BaseModel):
     liveness_score: float
     reason: str
     attendance: AttendanceMarkRead | None = None
+    samples_evaluated: int | None = None
+    samples_verified: int | None = None
+    consensus_ratio: float | None = None

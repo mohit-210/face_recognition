@@ -168,6 +168,9 @@ class AttendanceScanResponse {
     required this.livenessScore,
     required this.reason,
     required this.attendance,
+    required this.samplesEvaluated,
+    required this.samplesVerified,
+    required this.consensusRatio,
   });
 
   final bool verified;
@@ -177,6 +180,9 @@ class AttendanceScanResponse {
   final double livenessScore;
   final String reason;
   final AttendanceMarkRead? attendance;
+  final int? samplesEvaluated;
+  final int? samplesVerified;
+  final double? consensusRatio;
 
   factory AttendanceScanResponse.fromJson(Map<String, dynamic> json) {
     return AttendanceScanResponse(
@@ -189,6 +195,9 @@ class AttendanceScanResponse {
       attendance: json['attendance'] == null
           ? null
           : AttendanceMarkRead.fromJson(json['attendance'] as Map<String, dynamic>),
+      samplesEvaluated: json['samples_evaluated'] as int?,
+      samplesVerified: json['samples_verified'] as int?,
+      consensusRatio: (json['consensus_ratio'] as num?)?.toDouble(),
     );
   }
 }
@@ -353,6 +362,33 @@ class FaceApiClient {
         'previous_image_base64': previousImageBytes == null ? null : base64Encode(previousImageBytes),
         'device_id': deviceId,
         'mark_attendance': markAttendance,
+      },
+    );
+    return AttendanceScanResponse.fromJson(_decodeMap(response));
+  }
+
+  Future<AttendanceScanResponse> scanFaceBurstForAttendance({
+    required List<Uint8List> imageBytesBurst,
+    String? deviceId,
+    bool markAttendance = true,
+    int minVerifiedSamples = 2,
+    double minConsensusRatio = 0.67,
+  }) async {
+    if (imageBytesBurst.length < 2) {
+      throw FaceApiException('At least 2 frames are required for burst attendance scan.');
+    }
+    if (imageBytesBurst.length > 5) {
+      throw FaceApiException('A maximum of 5 frames is allowed for burst attendance scan.');
+    }
+    final response = await _sendAuthorized(
+      method: 'POST',
+      path: '/api/v1/attendance/scan-face-burst',
+      jsonBody: {
+        'images_base64': imageBytesBurst.map(base64Encode).toList(growable: false),
+        'device_id': deviceId,
+        'mark_attendance': markAttendance,
+        'min_verified_samples': minVerifiedSamples,
+        'min_consensus_ratio': minConsensusRatio,
       },
     );
     return AttendanceScanResponse.fromJson(_decodeMap(response));

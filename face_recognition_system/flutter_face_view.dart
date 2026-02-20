@@ -32,7 +32,8 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
   String _approvalLabel = 'Approve Mark In';
   AttendanceScanResponse? _pendingMatch;
   AttendanceMarkRead? _lastMarked;
-  Uint8List? _previousAttendanceFrame;
+  static const int _attendanceBurstFrames = 3;
+  static const Duration _attendanceBurstGap = Duration(milliseconds: 120);
 
   @override
   void initState() {
@@ -124,6 +125,24 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
     }
   }
 
+  Future<List<Uint8List>> _captureBurstFrames({
+    int frameCount = _attendanceBurstFrames,
+    Duration frameGap = _attendanceBurstGap,
+  }) async {
+    final frames = <Uint8List>[];
+    for (var i = 0; i < frameCount; i++) {
+      final frame = await _captureFrameBytes();
+      if (frame == null || frame.isEmpty) {
+        continue;
+      }
+      frames.add(frame);
+      if (i != frameCount - 1) {
+        await Future<void>.delayed(frameGap);
+      }
+    }
+    return frames;
+  }
+
   Future<void> _login() async {
     if (_busy) return;
 
@@ -162,38 +181,25 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
   Future<void> _scanFaceForAttendance() async {
     if (_busy || !_loggedIn || _apiClient == null) return;
 
-    final firstFrame = await _captureFrameBytes();
-    if (firstFrame == null || firstFrame.isEmpty) {
-      setState(() => _attendanceStatus = 'Unable to capture frame.');
+    final frames = await _captureBurstFrames();
+    if (frames.length < 2) {
+      setState(() => _attendanceStatus = 'Unable to capture enough live frames.');
       return;
     }
 
     setState(() {
       _busy = true;
-      _attendanceStatus = 'Matching face in company...';
+      _attendanceStatus = 'Matching face in company (burst scan)...';
     });
 
     try {
-      Uint8List currentFrame = firstFrame;
-      Uint8List? previousFrame = _previousAttendanceFrame ?? firstFrame;
-      if (_previousAttendanceFrame == null) {
-        await Future<void>.delayed(const Duration(milliseconds: 120));
-        final secondFrame = await _captureFrameBytes();
-        if (secondFrame == null || secondFrame.isEmpty) {
-          setState(() => _attendanceStatus = 'Unable to capture second live frame.');
-          return;
-        }
-        previousFrame = firstFrame;
-        currentFrame = secondFrame;
-      }
-
-      final result = await _apiClient!.scanFaceForAttendance(
-        imageBytes: currentFrame,
-        previousImageBytes: previousFrame,
+      final result = await _apiClient!.scanFaceBurstForAttendance(
+        imageBytesBurst: frames,
         deviceId: 'flutter-attendance',
         markAttendance: false,
+        minVerifiedSamples: 2,
+        minConsensusRatio: 0.67,
       );
-      _previousAttendanceFrame = currentFrame;
 
       if (!result.verified || result.userId == null || result.name == null) {
         setState(() {
@@ -215,7 +221,9 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
         _pendingMatch = result;
         _approvalLabel = markOutNext ? 'Approve Mark Out' : 'Approve Mark In';
         _attendanceStatus =
-            'Matched: ${result.name} (id=${result.userId}) | conf=${result.confidence.toStringAsFixed(3)}';
+            'Matched: ${result.name} (id=${result.userId}) | conf=${result.confidence.toStringAsFixed(3)}'
+            ' | live=${result.livenessScore.toStringAsFixed(3)}'
+            ' | consensus=${(100 * (result.consensusRatio ?? 0)).toStringAsFixed(0)}%';
       });
     } catch (e) {
       setState(() {
@@ -238,24 +246,18 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
     });
 
     try {
-      final firstFrame = await _captureFrameBytes();
-      if (firstFrame == null || firstFrame.isEmpty) {
-        setState(() => _attendanceStatus = 'Unable to capture frame for approval.');
+      final frames = await _captureBurstFrames();
+      if (frames.length < 2) {
+        setState(() => _attendanceStatus = 'Unable to capture enough live frames for approval.');
         return;
       }
 
-      await Future<void>.delayed(const Duration(milliseconds: 120));
-      final secondFrame = await _captureFrameBytes();
-      if (secondFrame == null || secondFrame.isEmpty) {
-        setState(() => _attendanceStatus = 'Unable to capture second frame for approval.');
-        return;
-      }
-
-      final approveScan = await client.scanFaceForAttendance(
-        imageBytes: secondFrame,
-        previousImageBytes: firstFrame,
+      final approveScan = await client.scanFaceBurstForAttendance(
+        imageBytesBurst: frames,
         deviceId: 'flutter-attendance-approve',
         markAttendance: true,
+        minVerifiedSamples: 2,
+        minConsensusRatio: 0.67,
       );
 
       if (
@@ -275,9 +277,11 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
       setState(() {
         _lastMarked = marked;
         _pendingMatch = null;
-        _previousAttendanceFrame = secondFrame;
         _approvalLabel = 'Approve Mark In';
-        _attendanceStatus = 'Marked: ${match.name} | $action | status=$status';
+        _attendanceStatus =
+            'Marked: ${match.name} | $action | status=$status'
+            ' | conf=${approveScan.confidence.toStringAsFixed(3)}'
+            ' | consensus=${(100 * (approveScan.consensusRatio ?? 0)).toStringAsFixed(0)}%';
       });
     } catch (e) {
       setState(() => _attendanceStatus = 'Approve failed: $e');
@@ -396,7 +400,6 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
                 ? null
                 : () => setState(() {
                       _pendingMatch = null;
-                      _previousAttendanceFrame = null;
                       _approvalLabel = 'Approve Mark In';
                       _attendanceStatus = 'Pending match cleared.';
                     }),
