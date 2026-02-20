@@ -12,6 +12,7 @@ from app.vision.recognition import RecognitionEngine
 
 COMPANY_INDEX_TTL_SECONDS = 20.0
 _company_index_cache: dict[int, dict] = {}
+MAX_REGISTER_IMAGES = 12
 
 
 @lru_cache(maxsize=1)
@@ -58,20 +59,19 @@ class FaceService:
             raise HTTPException(status_code=400, detail="User inactive")
 
         self.face_repo.clear_user_embeddings(user_id)
-        count = 0
-        for image_b64 in images_base64:
+        embeddings: list = []
+        # Limit processing for responsive UX when users capture too many frames.
+        for image_b64 in images_base64[:MAX_REGISTER_IMAGES]:
             image = self.detector.decode_image(image_b64)
-            detections = self.detector.detect(image)
-            if len(detections) != 1:
-                continue
-            det = detections[0]
-            face = self.detector.crop_face(image, det["bbox"])
             try:
-                emb = self.engine.embedder.get_embedding(face)
+                emb, face_count = self.engine.embedder.get_best_embedding(image)
             except ValueError:
                 continue
-            self.face_repo.add_embedding(user_id=user_id, embedding=emb)
-            count += 1
+            if face_count != 1:
+                continue
+            embeddings.append(emb)
+
+        count = self.face_repo.add_embeddings_bulk(user_id=user_id, embeddings=embeddings)
 
         if count == 0:
             raise HTTPException(status_code=400, detail="No valid face embedding could be generated from provided images")

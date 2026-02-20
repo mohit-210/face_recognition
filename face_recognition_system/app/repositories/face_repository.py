@@ -15,6 +15,14 @@ class FaceProfileRepository:
         self.db.refresh(profile)
         return profile
 
+    def add_embeddings_bulk(self, user_id: int, embeddings: list[np.ndarray]) -> int:
+        if not embeddings:
+            return 0
+        rows = [FaceProfile(user_id=user_id, embedding_vector=emb.astype(np.float32).tobytes()) for emb in embeddings]
+        self.db.add_all(rows)
+        self.db.commit()
+        return len(rows)
+
     def get_user_embeddings(self, user_id: int) -> list[np.ndarray]:
         profiles = self.db.query(FaceProfile).filter(FaceProfile.user_id == user_id).all()
         return [np.frombuffer(item.embedding_vector, dtype=np.float32) for item in profiles]
