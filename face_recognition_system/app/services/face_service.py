@@ -13,6 +13,8 @@ from app.vision.recognition import RecognitionEngine
 COMPANY_INDEX_TTL_SECONDS = 20.0
 _company_index_cache: dict[int, dict] = {}
 MAX_REGISTER_IMAGES = 12
+REGISTER_DUPLICATE_THRESHOLD_FLOOR = 0.55
+REGISTER_DUPLICATE_THRESHOLD_MARGIN = 0.05
 
 
 @lru_cache(maxsize=1)
@@ -53,12 +55,52 @@ class FaceService:
         _company_index_cache[company_id] = {"ts": now, "entries": entries}
         return entries
 
+    def _find_duplicate_user_in_company(
+        self,
+        company_id: int,
+        user_id: int,
+        candidate_embeddings: list,
+    ) -> tuple[int | None, str | None, float]:
+        users = self.user_service.list_by_company(company_id)
+        other_users = [u for u in users if u.id != user_id]
+        if not other_users:
+            return None, None, 0.0
+
+        embeddings_by_user = self.face_repo.get_embeddings_by_user_ids([u.id for u in other_users])
+        if not embeddings_by_user:
+            return None, None, 0.0
+
+        duplicate_threshold = max(
+            REGISTER_DUPLICATE_THRESHOLD_FLOOR,
+            self.engine.settings.recognition_threshold + REGISTER_DUPLICATE_THRESHOLD_MARGIN,
+        )
+        best_similarity = 0.0
+        best_user = None
+
+        for other_user in other_users:
+            enrolled = embeddings_by_user.get(other_user.id, [])
+            if not enrolled:
+                continue
+            similarity = max(
+                self.engine.cosine_similarity(candidate, saved)
+                for candidate in candidate_embeddings
+                for saved in enrolled
+            )
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_user = other_user
+            if similarity >= duplicate_threshold:
+                return other_user.id, other_user.name, float(similarity)
+
+        if best_user and best_similarity >= duplicate_threshold:
+            return best_user.id, best_user.name, float(best_similarity)
+        return None, None, float(best_similarity)
+
     def register_embeddings(self, user_id: int, images_base64: list[str]) -> int:
         user = self.user_service.get(user_id)
         if user.status != "active":
             raise HTTPException(status_code=400, detail="User inactive")
 
-        self.face_repo.clear_user_embeddings(user_id)
         embeddings: list = []
         # Limit processing for responsive UX when users capture too many frames.
         for image_b64 in images_base64[:MAX_REGISTER_IMAGES]:
@@ -71,10 +113,25 @@ class FaceService:
                 continue
             embeddings.append(emb)
 
-        count = self.face_repo.add_embeddings_bulk(user_id=user_id, embeddings=embeddings)
-
-        if count == 0:
+        if not embeddings:
             raise HTTPException(status_code=400, detail="No valid face embedding could be generated from provided images")
+
+        duplicate_user_id, duplicate_user_name, duplicate_similarity = self._find_duplicate_user_in_company(
+            company_id=user.company_id,
+            user_id=user_id,
+            candidate_embeddings=embeddings,
+        )
+        if duplicate_user_id is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Face already enrolled to {duplicate_user_name} "
+                    f"(user_id={duplicate_user_id}, confidence={duplicate_similarity:.3f})"
+                ),
+            )
+
+        self.face_repo.clear_user_embeddings(user_id)
+        count = self.face_repo.add_embeddings_bulk(user_id=user_id, embeddings=embeddings)
         self._invalidate_company_index(user.company_id)
         return count
 
