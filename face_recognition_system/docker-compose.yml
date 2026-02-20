@@ -1,0 +1,41 @@
+﻿version: "3.9"
+
+services:
+  api:
+    build: .
+    container_name: face_recognition_api
+    command: bash -lc "PYTHONPATH=/app alembic -c alembic.ini upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    volumes:
+      - .:/app
+    working_dir: /app
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=face_db
+      - DB_USER=face_user
+      - DB_PASSWORD=face_pass
+      - JWT_SECRET_KEY=super-secret-change
+      - JWT_REFRESH_SECRET_KEY=super-refresh-change
+      - RECOGNITION_THRESHOLD=0.45
+      - LIVENESS_THRESHOLD=0.65
+      - SESSION_SECRET_KEY=change-admin-session-secret
+
+  postgres:
+    image: postgres:16
+    container_name: face_recognition_postgres
+    restart: always
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: face_db
+      POSTGRES_USER: face_user
+      POSTGRES_PASSWORD: face_pass
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+volumes:
+  pg_data:
