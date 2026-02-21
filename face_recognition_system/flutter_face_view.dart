@@ -388,15 +388,15 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
       return;
     }
 
-    if (_captureQuality != 'high') {
-      await _setCaptureQuality('high');
-    }
-
-    final frames = await _captureBurstFrames(frameCount: 2);
-    if (frames.length < 2) {
-      setState(() => _attendanceStatus = 'Need 2 live frames to mark attendance. Hold still and retry.');
-      return;
-    }
+    // Old strict mode path kept (disabled):
+    // if (_captureQuality != 'high') {
+    //   await _setCaptureQuality('high');
+    // }
+    // final frames = await _captureBurstFrames(frameCount: 2);
+    // if (frames.length < 2) {
+    //   setState(() => _attendanceStatus = 'Need 2 live frames to mark attendance. Hold still and retry.');
+    //   return;
+    // }
 
     setState(() {
       _busy = true;
@@ -404,39 +404,55 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
     });
 
     try {
-      final burst = await client.scanFaceBurstForAttendance(
-        imageBytesBurst: frames,
-        deviceId: _burstStrictDeviceId,
-        markAttendance: true,
-        minVerifiedSamples: 2,
-        minConsensusRatio: 0.67,
-        fastMode: true,
-        debugTiming: true,
-      );
-      if (burst.verified && burst.userId != null && burst.name != null && burst.attendance != null) {
-        final marked = burst.attendance!;
-        setState(() {
-          _lastMarked = marked;
-          _pendingAttendanceCandidate = null;
-          _attendanceStatus =
-              'Marked: ${burst.name} | ${marked.action.replaceAll('_', ' ')}'
-              ' | status=${marked.record.status}'
-              ' | conf=${burst.confidence.toStringAsFixed(3)}'
-              ' | live=${burst.livenessScore.toStringAsFixed(3)}'
-              ' | consensus=${(100 * (burst.consensusRatio ?? 0)).toStringAsFixed(0)}%'
-              '${_thresholdSummary(burst.livenessThresholdUsed)}'
-              '${_modelSummary(burst.modelUsed)}'
-              '${_timingSummary(burst.debugTimings)}';
-        });
-        return;
-      }
-
+      final marked = await client.markVerifiedAttendance(userId: pending.userId!);
       setState(() {
+        _lastMarked = marked;
         _pendingAttendanceCandidate = null;
         _attendanceStatus =
-            'Mark failed: ${burst.reason}${_modelSummary(burst.modelUsed)}${_timingSummary(burst.debugTimings)}. '
-            'Please scan again.';
+            'Marked: ${pending.name} | ${marked.action.replaceAll('_', ' ')}'
+            ' | status=${marked.record.status}'
+            ' | from pre-scan'
+            ' | conf=${pending.confidence.toStringAsFixed(3)}'
+            ' | live=${pending.livenessScore.toStringAsFixed(3)}'
+            '${_thresholdSummary(pending.livenessThresholdUsed)}'
+            '${_modelSummary(pending.modelUsed)}'
+            '${_timingSummary(pending.debugTimings)}';
       });
+
+      // Old strict re-check before marking (kept intentionally as requested):
+      // final burst = await client.scanFaceBurstForAttendance(
+      //   imageBytesBurst: frames,
+      //   deviceId: _burstStrictDeviceId,
+      //   markAttendance: true,
+      //   minVerifiedSamples: 2,
+      //   minConsensusRatio: 0.67,
+      //   fastMode: true,
+      //   debugTiming: true,
+      // );
+      // if (burst.verified && burst.userId != null && burst.name != null && burst.attendance != null) {
+      //   final marked = burst.attendance!;
+      //   setState(() {
+      //     _lastMarked = marked;
+      //     _pendingAttendanceCandidate = null;
+      //     _attendanceStatus =
+      //         'Marked: ${burst.name} | ${marked.action.replaceAll('_', ' ')}'
+      //         ' | status=${marked.record.status}'
+      //         ' | conf=${burst.confidence.toStringAsFixed(3)}'
+      //         ' | live=${burst.livenessScore.toStringAsFixed(3)}'
+      //         ' | consensus=${(100 * (burst.consensusRatio ?? 0)).toStringAsFixed(0)}%'
+      //         '${_thresholdSummary(burst.livenessThresholdUsed)}'
+      //         '${_modelSummary(burst.modelUsed)}'
+      //         '${_timingSummary(burst.debugTimings)}';
+      //   });
+      //   return;
+      // }
+      //
+      // setState(() {
+      //   _pendingAttendanceCandidate = null;
+      //   _attendanceStatus =
+      //       'Mark failed: ${burst.reason}${_modelSummary(burst.modelUsed)}${_timingSummary(burst.debugTimings)}. '
+      //       'Please scan again.';
+      // });
     } catch (e) {
       setState(() => _attendanceStatus = 'Attendance mark failed: ${_readableError(e)}');
     } finally {

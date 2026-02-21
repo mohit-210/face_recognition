@@ -43,6 +43,10 @@ class AttendanceBurstScanRequest(BaseModel):
     debug_timing: bool = False
 
 
+class AttendanceMarkVerifiedRequest(BaseModel):
+    user_id: int
+
+
 class AttendanceScanResponse(BaseModel):
     verified: bool
     user_id: int | None

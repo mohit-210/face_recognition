@@ -9,6 +9,7 @@ from app.database.session import get_db
 from app.schemas.attendance import (
     AttendanceBurstScanRequest,
     AttendanceMarkRead,
+    AttendanceMarkVerifiedRequest,
     AttendanceRead,
     AttendanceScanRequest,
     AttendanceScanResponse,
@@ -246,6 +247,19 @@ def list_attendance(
         attendance_date=attendance_date,
         user_id=user_id,
     )
+
+
+@router.post("/mark-verified", response_model=AttendanceMarkRead)
+def mark_verified_attendance(
+    payload: AttendanceMarkVerifiedRequest,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    marked = AttendanceService(db).mark_verified_face(
+        company_id=current_user.company_id,
+        user_id=int(payload.user_id),
+    )
+    return AttendanceMarkRead.model_validate(marked)
 
 
 @router.post("/users/{user_id}/checkout", response_model=AttendanceMarkRead)

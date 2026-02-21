@@ -456,6 +456,17 @@ class FaceApiClient {
     return AttendanceMarkRead.fromJson(_decodeMap(response));
   }
 
+  Future<AttendanceMarkRead> markVerifiedAttendance({required int userId}) async {
+    final response = await _sendAuthorized(
+      method: 'POST',
+      path: '/api/v1/attendance/mark-verified',
+      jsonBody: {
+        'user_id': userId,
+      },
+    );
+    return AttendanceMarkRead.fromJson(_decodeMap(response));
+  }
+
   Future<http.Response> _sendAuthorized({
     required String method,
     required String path,
