@@ -12,7 +12,7 @@ class FaceOpsPage extends StatefulWidget {
 }
 
 class _FaceOpsPageState extends State<FaceOpsPage> {
-  final TextEditingController _baseUrlCtrl = TextEditingController(text: 'http://');
+  final TextEditingController _baseUrlCtrl = TextEditingController(text: 'http://localhost:8000');
   final TextEditingController _companyIdCtrl = TextEditingController();
   final TextEditingController _adminCodeCtrl = TextEditingController();
   final TextEditingController _adminPasswordCtrl = TextEditingController();
@@ -36,9 +36,15 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
 
   String _status = 'Ready';
   String _attendanceStatus = 'No attendance marked yet.';
+  String? _activeBaseUrl;
+  int? _activeCompanyId;
   AttendanceMarkRead? _lastMarked;
+  AttendanceScanResponse? _pendingAttendanceCandidate;
   static const int _attendanceBurstFrames = 2;
   static const Duration _attendanceBurstGap = Duration(milliseconds: 110);
+  static const String _monitorDeviceId = 'flutter-attendance-monitor';
+  static const String _burstStrictDeviceId = 'flutter-attendance-burst-strict';
+  static const String _burstRetryDeviceId = 'flutter-attendance-burst-retry';
 
   @override
   void initState() {
@@ -196,24 +202,16 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
         _apiClient?.dispose();
         _apiClient = client;
         _loggedIn = true;
-        _status = 'Login successful';
+        _pendingAttendanceCandidate = null;
+        _activeBaseUrl = client.baseUrl;
+        _activeCompanyId = companyId;
+        _status = 'Login successful | url=${client.baseUrl} | company_id=$companyId';
       });
     } catch (e) {
       setState(() => _status = 'Login failed: $e');
     } finally {
       setState(() => _busy = false);
     }
-  }
-
-  bool _shouldRetryWithBurst(AttendanceScanResponse result) {
-    if (result.verified) return false;
-    final reason = result.reason.toLowerCase();
-    if (reason.contains('multiple faces')) return false;
-    return reason.contains('no face') ||
-        reason.contains('mismatch') ||
-        reason.contains('liveness') ||
-        reason.contains('embedding') ||
-        result.confidence >= 0.35;
   }
 
   String _timingSummary(Map<String, double>? timings) {
@@ -261,7 +259,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
       final result = await client.scanFaceForAttendance(
         imageBytes: frame,
         previousImageBytes: previous,
-        deviceId: 'flutter-attendance-monitor',
+        deviceId: _monitorDeviceId,
         markAttendance: false,
         fastMode: true,
         debugTiming: true,
@@ -330,13 +328,9 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
     });
   }
 
-  Future<void> _scanAndMarkAttendance() async {
+  Future<void> _scanFaceForAttendance() async {
     final client = _apiClient;
     if (_busy || !_loggedIn || client == null) return;
-
-    if (_captureQuality != 'high') {
-      await _setCaptureQuality('high');
-    }
 
     final frames = await _captureBurstFrames(frameCount: 2);
     if (frames.length < 2) {
@@ -346,13 +340,73 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
 
     setState(() {
       _busy = true;
-      _attendanceStatus = 'Checking live face and marking attendance...';
+      _attendanceStatus = 'Scanning face (no mark yet)...';
     });
 
     try {
       final burst = await client.scanFaceBurstForAttendance(
         imageBytesBurst: frames,
-        deviceId: 'flutter-attendance-burst-strict',
+        deviceId: _monitorDeviceId,
+        markAttendance: false,
+        minVerifiedSamples: 1,
+        minConsensusRatio: 0.50,
+        fastMode: true,
+        debugTiming: true,
+      );
+      if (burst.verified && burst.userId != null && burst.name != null) {
+        setState(() {
+          _pendingAttendanceCandidate = burst;
+          _attendanceStatus =
+              'Verified: ${burst.name} (not marked yet)'
+              ' | conf=${burst.confidence.toStringAsFixed(3)}'
+              ' | live=${burst.livenessScore.toStringAsFixed(3)}'
+              '${_thresholdSummary(burst.livenessThresholdUsed)}'
+              '${_modelSummary(burst.modelUsed)}'
+              '${_timingSummary(burst.debugTimings)}';
+        });
+        return;
+      }
+
+      setState(() {
+        _pendingAttendanceCandidate = null;
+        _attendanceStatus = '${burst.reason}${_modelSummary(burst.modelUsed)}${_timingSummary(burst.debugTimings)}';
+      });
+    } catch (e) {
+      setState(() {
+        _pendingAttendanceCandidate = null;
+        _attendanceStatus = 'Attendance scan failed: ${_readableError(e)}';
+      });
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _markVerifiedAttendance() async {
+    final client = _apiClient;
+    final pending = _pendingAttendanceCandidate;
+    if (_busy || !_loggedIn || client == null || pending == null || pending.userId == null || pending.name == null) {
+      return;
+    }
+
+    if (_captureQuality != 'high') {
+      await _setCaptureQuality('high');
+    }
+
+    final frames = await _captureBurstFrames(frameCount: 2);
+    if (frames.length < 2) {
+      setState(() => _attendanceStatus = 'Need 2 live frames to mark attendance. Hold still and retry.');
+      return;
+    }
+
+    setState(() {
+      _busy = true;
+      _attendanceStatus = 'Marking attendance for ${pending.name}...';
+    });
+
+    try {
+      final burst = await client.scanFaceBurstForAttendance(
+        imageBytesBurst: frames,
+        deviceId: _burstStrictDeviceId,
         markAttendance: true,
         minVerifiedSamples: 2,
         minConsensusRatio: 0.67,
@@ -363,6 +417,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
         final marked = burst.attendance!;
         setState(() {
           _lastMarked = marked;
+          _pendingAttendanceCandidate = null;
           _attendanceStatus =
               'Marked: ${burst.name} | ${marked.action.replaceAll('_', ' ')}'
               ' | status=${marked.record.status}'
@@ -376,52 +431,14 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
         return;
       }
 
-      if (!_shouldRetryWithBurst(burst)) {
-        setState(() {
-          _attendanceStatus = '${burst.reason}${_modelSummary(burst.modelUsed)}${_timingSummary(burst.debugTimings)}';
-        });
-        return;
-      }
-
-      setState(() => _attendanceStatus = 'Retrying with stronger live check...');
-      final retryFrames = await _captureBurstFrames(frameCount: 3);
-      if (retryFrames.length < 2) {
-        setState(() => _attendanceStatus = 'Retry failed: unable to capture enough live frames.');
-        return;
-      }
-
-      final retry = await client.scanFaceBurstForAttendance(
-        imageBytesBurst: retryFrames,
-        deviceId: 'flutter-attendance-burst-retry',
-        markAttendance: true,
-        minVerifiedSamples: 2,
-        minConsensusRatio: 0.67,
-        fastMode: true,
-        debugTiming: true,
-      );
-      if (!retry.verified || retry.userId == null || retry.name == null || retry.attendance == null) {
-        setState(() {
-          _attendanceStatus = '${retry.reason}${_modelSummary(retry.modelUsed)}${_timingSummary(retry.debugTimings)}';
-        });
-        return;
-      }
-
-      final marked = retry.attendance!;
       setState(() {
-        _lastMarked = marked;
+        _pendingAttendanceCandidate = null;
         _attendanceStatus =
-            'Marked (retry): ${retry.name} | ${marked.action.replaceAll('_', ' ')}'
-            ' | status=${marked.record.status}'
-            ' | conf=${retry.confidence.toStringAsFixed(3)}'
-            ' | live=${retry.livenessScore.toStringAsFixed(3)}'
-            ' | consensus=${(100 * (retry.consensusRatio ?? 0)).toStringAsFixed(0)}%'
-            '${_thresholdSummary(retry.livenessThresholdUsed)}'
-            '${_modelSummary(retry.modelUsed)}'
-            ' | samples=${retry.samplesVerified ?? 0}/${retry.samplesEvaluated ?? 0}'
-            '${_timingSummary(retry.debugTimings)}';
+            'Mark failed: ${burst.reason}${_modelSummary(burst.modelUsed)}${_timingSummary(burst.debugTimings)}. '
+            'Please scan again.';
       });
     } catch (e) {
-      setState(() => _attendanceStatus = 'Attendance failed: ${_readableError(e)}');
+      setState(() => _attendanceStatus = 'Attendance mark failed: ${_readableError(e)}');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -487,7 +504,10 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
                   const SizedBox(height: 12),
                   Align(
                     alignment: Alignment.centerLeft,
-                    child: Text('Status: $_status | Camera quality: $_captureQuality'),
+                    child: Text(
+                      'Status: $_status | Camera quality: $_captureQuality'
+                      ' | url=${_activeBaseUrl ?? "-"} | company_id=${_activeCompanyId ?? "-"}',
+                    ),
                   ),
                 ],
               ),
@@ -508,6 +528,14 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
           _input(_adminCodeCtrl, 'Admin Employee Code'),
           _input(_adminPasswordCtrl, 'Admin Password', obscure: true),
           const SizedBox(height: 10),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              'Using IDs -> monitor=$_monitorDeviceId, strict=$_burstStrictDeviceId, retry=$_burstRetryDeviceId',
+              style: const TextStyle(fontSize: 12),
+            ),
+          ),
+          const SizedBox(height: 6),
           ElevatedButton(
             onPressed: _busy ? null : _login,
             child: Text(_loggedIn ? 'Logged In' : 'Login'),
@@ -518,8 +546,10 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
   }
 
   Widget _buildAttendanceSection(bool cameraReady) {
+    final pending = _pendingAttendanceCandidate;
+    final canMarkPending = pending != null && pending.userId != null && pending.name != null;
     return _sectionCard(
-      title: '2) Attendance Fast Flow',
+      title: '2) Attendance Two-Step Flow',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -527,8 +557,23 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
             children: [
               Expanded(
                 child: ElevatedButton(
-                  onPressed: _busy || !_loggedIn || !cameraReady ? null : _scanAndMarkAttendance,
-                  child: const Text('Scan & Mark Attendance'),
+                  onPressed: _busy || !_loggedIn || !cameraReady ? null : _scanFaceForAttendance,
+                  child: const Text('Scan Face'),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: ElevatedButton(
+                  onPressed: _busy || !_loggedIn || !cameraReady || !canMarkPending ? null : _markVerifiedAttendance,
+                  child: Text(
+                    canMarkPending
+                        ? 'Mark Attendance (${pending!.name})'
+                        : 'Mark Attendance',
+                  ),
                 ),
               ),
             ],

@@ -417,6 +417,7 @@ class FaceService:
 
         liveness_score = 1.0
         motion_score = 0.0
+        motion_diff = 0.0
         det = None
         query_emb = None
 
@@ -518,6 +519,10 @@ class FaceService:
                     liveness_score = float((0.80 * float(passive.confidence)) + (0.20 * heuristic_liveness))
 
             motion_score = float(self.engine.liveness._motion_score(face, previous_face))
+            if previous_face is not None and previous_face.size > 0 and face.size > 0:
+                curr_gray = cv2.cvtColor(cv2.resize(face, (128, 128)), cv2.COLOR_BGR2GRAY)
+                prev_gray = cv2.cvtColor(cv2.resize(previous_face, (128, 128)), cv2.COLOR_BGR2GRAY)
+                motion_diff = float(np.mean(cv2.absdiff(curr_gray, prev_gray)))
 
             if (
                 not using_fallback_liveness
@@ -546,11 +551,33 @@ class FaceService:
                     liveness=liveness_score,
                     bbox=det["bbox"],
                 )
+            if not using_fallback_liveness and require_live_motion:
+                # Keep hybrid scoring, but require the CNN stream to stay above a soft floor
+                # so a static spoof cannot pass purely on heuristic noise/motion.
+                passive_floor = max(0.45, required_liveness - 0.08)
+                if float(passive.confidence) < passive_floor:
+                    return _fail(
+                        (
+                            "Passive liveness too low "
+                            f"(cnn={float(passive.confidence):.2f}, min={passive_floor:.2f})"
+                        ),
+                        liveness=liveness_score,
+                        bbox=det["bbox"],
+                    )
             if require_live_motion and motion_score < self.engine.settings.attendance_min_motion_score:
                 return _fail(
                     (
                         "Insufficient live motion "
                         f"(score={motion_score:.2f}, min={self.engine.settings.attendance_min_motion_score:.2f})"
+                    ),
+                    liveness=liveness_score,
+                    bbox=det["bbox"],
+                )
+            if require_live_motion and motion_diff < float(self.engine.settings.attendance_min_motion_diff):
+                return _fail(
+                    (
+                        "Insufficient frame change "
+                        f"(diff={motion_diff:.2f}, min={self.engine.settings.attendance_min_motion_diff:.2f})"
                     ),
                     liveness=liveness_score,
                     bbox=det["bbox"],

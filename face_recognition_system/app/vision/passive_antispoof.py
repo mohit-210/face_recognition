@@ -264,6 +264,44 @@ class PassiveAntiSpoofDetector:
             scaled = conf * (0.48 / max(1e-6, thr))
         return float(np.clip(scaled, 0.0, 1.0))
 
+    def _onnx_to_live_confidence(self, pred: np.ndarray) -> float:
+        """
+        Convert ONNX output tensor to live probability.
+        Supports:
+        - binary scalar sigmoid output
+        - 2-class logits/probabilities [spoof, live] or [live, spoof] via configurable live index
+        """
+        arr = np.asarray(pred, dtype=np.float32)
+        if arr.size == 0:
+            return 0.0
+
+        # Scalar/binary output.
+        if arr.ndim == 0 or (arr.ndim == 1 and arr.shape[0] == 1):
+            return float(np.clip(arr.reshape(-1)[0], 0.0, 1.0))
+
+        if arr.ndim == 1:
+            vec = arr
+        else:
+            vec = arr.reshape(arr.shape[0], -1)[0]
+
+        # If model already outputs probabilities, use directly.
+        if np.all(vec >= 0.0) and np.all(vec <= 1.0):
+            s = float(np.sum(vec))
+            if 0.95 <= s <= 1.05:
+                probs = vec
+            else:
+                probs = vec / max(1e-6, s)
+        else:
+            # Treat as logits.
+            shifted = vec - float(np.max(vec))
+            exps = np.exp(shifted)
+            probs = exps / max(1e-6, float(np.sum(exps)))
+
+        live_idx = int(self.settings.passive_antispoof_onnx_live_index)
+        if live_idx < 0 or live_idx >= probs.shape[0]:
+            live_idx = min(1, probs.shape[0] - 1)
+        return float(np.clip(float(probs[live_idx]), 0.0, 1.0))
+
     def score(self, face_bgr: np.ndarray) -> PassiveLivenessResult:
         if face_bgr.size == 0:
             return PassiveLivenessResult(confidence=0.0, environmental_error="Environmental Error: empty face crop")
@@ -299,9 +337,10 @@ class PassiveAntiSpoofDetector:
                 [self.onnx_output_name],
                 {self.onnx_input_name: onnx_input},
             )[0]
+            base_conf = self._onnx_to_live_confidence(pred)
         else:
             pred = model.predict(np.expand_dims(sample, axis=0), verbose=0)
-        base_conf = float(np.clip(float(np.asarray(pred).reshape(-1)[0]), 0.0, 1.0))
+            base_conf = float(np.clip(float(np.asarray(pred).reshape(-1)[0]), 0.0, 1.0))
 
         # Boundary-focused TTA: only run extra views when score is ambiguous.
         confidence = base_conf
@@ -323,7 +362,14 @@ class PassiveAntiSpoofDetector:
                     [self.onnx_output_name],
                     {self.onnx_input_name: onnx_tta_input},
                 )[0]
-                tta_pred = np.asarray(tta_pred).reshape(-1)
+                tta_raw = np.asarray(tta_pred)
+                if tta_raw.ndim >= 2:
+                    tta_scores = [
+                        self._onnx_to_live_confidence(tta_raw[i : i + 1]) for i in range(int(tta_raw.shape[0]))
+                    ]
+                    tta_pred = np.asarray(tta_scores, dtype=np.float32).reshape(-1)
+                else:
+                    tta_pred = np.asarray([self._onnx_to_live_confidence(tta_raw)], dtype=np.float32)
             else:
                 tta_pred = model.predict(tta_batch, verbose=0).reshape(-1)
             confidence = float(np.clip(float(np.mean(tta_pred)), 0.0, 1.0))

@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     passive_antispoof_onnx_path: str = "./models/passive_antispoof.onnx"
     passive_antispoof_backend: str = "auto"
     passive_antispoof_onnx_input_size: int = Field(default=128, ge=64, le=256)
+    passive_antispoof_onnx_live_index: int = Field(default=0, ge=0, le=4)
     passive_antispoof_calibration_path: str = "./models/passive_antispoof_calibration.json"
     passive_quality_gate_enabled: bool = Field(default=False)
     passive_calibration_max_eer: float = Field(default=0.75, ge=0.0, le=1.0)

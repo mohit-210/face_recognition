@@ -78,6 +78,9 @@ class FaceLockManager:
 _lock_managers: dict[int, FaceLockManager] = {}
 _attendance_bbox_cache: dict[int, dict] = {}
 _ATTENDANCE_BBOX_TTL_SECONDS = 3.0
+_attendance_confirm_cache: dict[int, dict] = {}
+_ATTENDANCE_CONFIRM_WINDOW_SECONDS = 3.0
+_ATTENDANCE_CONFIRM_REQUIRED = 2
 
 
 def _get_lock_manager(user_id: int) -> FaceLockManager:
@@ -107,6 +110,28 @@ def _set_recent_attendance_bbox(user_id: int, bbox: list[int] | None) -> None:
         _attendance_bbox_cache.pop(user_id, None)
         return
     _attendance_bbox_cache[user_id] = {"ts": time.monotonic(), "bbox": [int(v) for v in bbox]}
+
+
+def _consume_attendance_confirm(admin_user_id: int, target_user_id: int) -> tuple[bool, int]:
+    """
+    Require consecutive verified detections for the same user before marking attendance.
+    This blocks one-off false accepts from printed/screen spoofs.
+    """
+    now = time.monotonic()
+    prev = _attendance_confirm_cache.get(admin_user_id)
+    count = 1
+    if prev:
+        prev_ts = float(prev.get("ts", 0.0))
+        prev_user_id = int(prev.get("user_id", -1))
+        prev_count = int(prev.get("count", 0))
+        if (now - prev_ts) <= _ATTENDANCE_CONFIRM_WINDOW_SECONDS and prev_user_id == target_user_id:
+            count = prev_count + 1
+    _attendance_confirm_cache[admin_user_id] = {"ts": now, "user_id": target_user_id, "count": count}
+    return count >= _ATTENDANCE_CONFIRM_REQUIRED, count
+
+
+def _reset_attendance_confirm(admin_user_id: int) -> None:
+    _attendance_confirm_cache.pop(admin_user_id, None)
 
 
 def _redirect(path: str, msg: str = "", error: str = "") -> RedirectResponse:
@@ -902,11 +927,25 @@ def admin_attendance_scan(
     )
     _set_recent_attendance_bbox(current.id, identified.get("_bbox"))
     if not identified.get("verified") or identified.get("user_id") is None:
+        _reset_attendance_confirm(current.id)
         return identified
 
+    target_user_id = int(identified["user_id"])
+    confirmed, confirm_count = _consume_attendance_confirm(current.id, target_user_id)
+    if not confirmed:
+        return {
+            **identified,
+            "verified": False,
+            "reason": (
+                f"Live confirmation {confirm_count}/{_ATTENDANCE_CONFIRM_REQUIRED}; "
+                "hold steady for one more scan"
+            ),
+        }
+
+    _reset_attendance_confirm(current.id)
     marked = AttendanceService(db).mark_verified_face(
         company_id=current.company_id,
-        user_id=int(identified["user_id"]),
+        user_id=target_user_id,
     )
     return {
         **identified,
