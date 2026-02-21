@@ -4,8 +4,13 @@ import cv2
 import numpy as np
 from retinaface import RetinaFace
 
+from app.core.config import get_settings
+
 
 class FaceDetector:
+    def __init__(self) -> None:
+        self.settings = get_settings()
+
     def detect(self, image_bgr: np.ndarray) -> list[dict]:
         result = RetinaFace.detect_faces(image_bgr)
         if not isinstance(result, dict):
@@ -14,13 +19,17 @@ class FaceDetector:
         detections = []
         for face in result.values():
             x1, y1, x2, y2 = face["facial_area"]
+            score = float(face.get("score", 0.0))
+            if score < float(self.settings.retinaface_min_score):
+                continue
             detections.append(
                 {
                     "bbox": [int(x1), int(y1), int(x2), int(y2)],
                     "landmarks": face.get("landmarks", {}),
-                    "score": float(face.get("score", 0.0)),
+                    "score": score,
                 }
             )
+        detections.sort(key=lambda d: float(d.get("score", 0.0)), reverse=True)
         return detections
 
     @staticmethod

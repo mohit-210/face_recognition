@@ -9,6 +9,10 @@ import cv2
 import numpy as np
 
 from app.core.config import get_settings
+try:
+    import onnxruntime as ort
+except Exception:  # pragma: no cover
+    ort = None
 
 STANDALONE_KERAS = None
 STANDALONE_KERAS_IMPORT_ERROR = None
@@ -83,11 +87,15 @@ class PassiveAntiSpoofDetector:
     def __init__(self) -> None:
         self.settings = get_settings()
         self.model = None
+        self.onnx_session = None
+        self.onnx_input_name: str | None = None
+        self.onnx_output_name: str | None = None
         self.model_ready = False
         self.calibration_ok = False
         self.calibration: dict = {}
         self.model_descriptor = "passive_antispoof_unavailable"
         self.model_path = Path(self.settings.passive_antispoof_model_path)
+        self.onnx_path = Path(self.settings.passive_antispoof_onnx_path)
         self.calibration_path = Path(self.settings.passive_antispoof_calibration_path)
         self._load_attempted = False
         self._load_components()
@@ -100,7 +108,31 @@ class PassiveAntiSpoofDetector:
             except Exception:
                 self.calibration = {}
 
-        if self.model_path.exists():
+        backend_pref = (self.settings.passive_antispoof_backend or "auto").strip().lower()
+
+        if self.onnx_path.exists() and (backend_pref in {"auto", "onnx"}):
+            if ort is None:
+                logger.warning("ONNX backend requested but onnxruntime is unavailable.")
+            else:
+                try:
+                    session = ort.InferenceSession(str(self.onnx_path), providers=["CPUExecutionProvider"])
+                    inps = session.get_inputs()
+                    outs = session.get_outputs()
+                    if not inps or not outs:
+                        raise RuntimeError("ONNX model has no IO tensors")
+                    self.onnx_session = session
+                    self.onnx_input_name = inps[0].name
+                    self.onnx_output_name = outs[0].name
+                    self.model_ready = True
+                    self.model_descriptor = f"mini_fasnet_onnx ({self.onnx_path.name}) via onnxruntime"
+                except Exception:
+                    self.onnx_session = None
+                    self.onnx_input_name = None
+                    self.onnx_output_name = None
+                    self.model_ready = False
+                    logger.exception("Failed to load passive anti-spoof ONNX model from %s", self.onnx_path)
+
+        if (not self.model_ready) and self.model_path.exists() and (backend_pref in {"auto", "keras", "tf", "tensorflow"}):
             loaders: list[tuple[str, object]] = []
             if STANDALONE_KERAS is not None:
                 loaders.append(("keras", STANDALONE_KERAS))
@@ -121,6 +153,7 @@ class PassiveAntiSpoofDetector:
             for backend_name, backend in loaders:
                 try:
                     self.model = backend.models.load_model(self.model_path, compile=False)
+                    self.onnx_session = None
                     self.model_ready = True
                     model_name = getattr(self.model, "name", "model")
                     self.model_descriptor = f"{model_name} ({self.model_path.name}) via {backend_name}"
@@ -133,9 +166,13 @@ class PassiveAntiSpoofDetector:
                         self.model_path,
                         backend_name,
                     )
-        elif not self.model_path.exists():
+        elif not self.model_path.exists() and not self.onnx_path.exists():
             self.model_ready = False
-            logger.warning("Passive anti-spoof model file not found at %s", self.model_path)
+            logger.warning(
+                "Passive anti-spoof model files not found at %s (keras) or %s (onnx)",
+                self.model_path,
+                self.onnx_path,
+            )
 
         if self.model_ready:
             eer = float(self.calibration.get("eer", 1.0))
@@ -177,6 +214,18 @@ class PassiveAntiSpoofDetector:
 
         stacked = np.stack([gray, lap, magnitude.astype(np.float32)], axis=-1).astype(np.float32)
         return stacked
+
+    @staticmethod
+    def _enhance_luma(face_bgr: np.ndarray) -> np.ndarray:
+        """
+        Mild luminance normalization for difficult lighting without distorting spoof cues.
+        """
+        ycrcb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2YCrCb)
+        y, cr, cb = cv2.split(ycrcb)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        y_eq = clahe.apply(y)
+        merged = cv2.merge((y_eq, cr, cb))
+        return cv2.cvtColor(merged, cv2.COLOR_YCrCb2BGR)
 
     def _environment_check(self, face_bgr: np.ndarray) -> tuple[str | None, float]:
         gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
@@ -230,18 +279,55 @@ class PassiveAntiSpoofDetector:
             self._load_components()
 
         model = self.model
-        if model is None or not self.model_ready:
+        onnx_session = self.onnx_session
+        if ((model is None and onnx_session is None) or not self.model_ready):
             return PassiveLivenessResult(
                 confidence=0.0,
                 reason=(
                     "Passive anti-spoof model unavailable. "
-                    f"Ensure model exists at {self.model_path} and runtime has tensorflow.keras or tf_keras."
+                    f"Ensure model exists at {self.onnx_path} (onnx) or {self.model_path} (keras)."
                 ),
             )
 
-        sample = self.preprocess(face_bgr)
-        pred = model.predict(np.expand_dims(sample, axis=0), verbose=0)
-        confidence = float(np.clip(float(pred.reshape(-1)[0]), 0.0, 1.0))
+        # Base prediction first.
+        preprocess_size = int(self.settings.passive_antispoof_onnx_input_size) if onnx_session is not None else 128
+        sample = self.preprocess(face_bgr, out_size=preprocess_size)
+        if onnx_session is not None and self.onnx_input_name and self.onnx_output_name:
+            # MiniFASNet ONNX exports are channel-first (NCHW).
+            onnx_input = np.expand_dims(sample, axis=0).astype(np.float32).transpose(0, 3, 1, 2)
+            pred = onnx_session.run(
+                [self.onnx_output_name],
+                {self.onnx_input_name: onnx_input},
+            )[0]
+        else:
+            pred = model.predict(np.expand_dims(sample, axis=0), verbose=0)
+        base_conf = float(np.clip(float(np.asarray(pred).reshape(-1)[0]), 0.0, 1.0))
+
+        # Boundary-focused TTA: only run extra views when score is ambiguous.
+        confidence = base_conf
+        if 0.30 <= base_conf <= 0.75:
+            face_flip = cv2.flip(face_bgr, 1)
+            face_luma = self._enhance_luma(face_bgr)
+            tta_batch = np.stack(
+                [
+                    sample,
+                    self.preprocess(face_flip, out_size=preprocess_size),
+                    self.preprocess(face_luma, out_size=preprocess_size),
+                ],
+                axis=0,
+            )
+            if onnx_session is not None and self.onnx_input_name and self.onnx_output_name:
+                # MiniFASNet ONNX exports are channel-first (NCHW).
+                onnx_tta_input = tta_batch.astype(np.float32).transpose(0, 3, 1, 2)
+                tta_pred = onnx_session.run(
+                    [self.onnx_output_name],
+                    {self.onnx_input_name: onnx_tta_input},
+                )[0]
+                tta_pred = np.asarray(tta_pred).reshape(-1)
+            else:
+                tta_pred = model.predict(tta_batch, verbose=0).reshape(-1)
+            confidence = float(np.clip(float(np.mean(tta_pred)), 0.0, 1.0))
+
         confidence = self._apply_threshold_calibration(confidence)
 
         calibrated_bias = float(self.calibration.get("score_bias", 0.0))

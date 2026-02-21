@@ -1,13 +1,18 @@
-﻿import cv2
+import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
+
+from app.core.config import get_settings
 
 
 class FaceEmbedder:
     def __init__(self) -> None:
-        self.model = FaceAnalysis(name="buffalo_l")
+        settings = get_settings()
+        model_name = settings.arcface_model_name.strip() or "buffalo_l"
+        det_size = int(settings.arcface_det_size)
+        self.model = FaceAnalysis(name=model_name)
         # CPU-safe default. Switch to GPU by setting ctx_id >= 0 in production if available.
-        self.model.prepare(ctx_id=-1, det_size=(640, 640))
+        self.model.prepare(ctx_id=-1, det_size=(det_size, det_size))
 
     def get_embedding(self, face_bgr: np.ndarray) -> np.ndarray:
         if face_bgr.size == 0:
@@ -68,3 +73,4 @@ class FaceEmbedder:
                 candidates.append(resized)
 
         return candidates
+

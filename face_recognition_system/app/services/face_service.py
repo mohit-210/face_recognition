@@ -382,6 +382,8 @@ class FaceService:
 
         model_used = "none"
         liveness_threshold_used: float | None = None
+        device_tag = (device_id or "").strip().lower()
+        mobile_mode = ("flutter" in device_tag) or ("mobile" in device_tag)
 
         def _fail(reason: str, liveness: float = 0.0, bbox: list[int] | None = None) -> dict:
             return _finish(
@@ -509,8 +511,11 @@ class FaceService:
                         previous_face_bgr=previous_face,
                     )
                 )
-                # Blend CNN with motion/texture heuristic for stability on imperfect calibrations.
-                liveness_score = float((0.72 * float(passive.confidence)) + (0.28 * heuristic_liveness))
+                if mobile_mode:
+                    # Favor CNN output on mobile captures where heuristic can be noisy.
+                    liveness_score = float((0.88 * float(passive.confidence)) + (0.12 * heuristic_liveness))
+                else:
+                    liveness_score = float((0.80 * float(passive.confidence)) + (0.20 * heuristic_liveness))
 
             motion_score = float(self.engine.liveness._motion_score(face, previous_face))
 
@@ -521,7 +526,8 @@ class FaceService:
                 and face.size > 0
                 and self._is_rigid_planar_replay(previous_face, face)
             ):
-                liveness_score = max(0.0, liveness_score - 0.20)
+                replay_penalty = 0.12 if mobile_mode else 0.20
+                liveness_score = max(0.0, liveness_score - replay_penalty)
             timings["liveness_ms"] += (time.perf_counter() - t0) * 1000.0
 
             # Use attendance-specific threshold for attendance flows instead of enforcing

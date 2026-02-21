@@ -1,4 +1,5 @@
 import 'dart:typed_data';
+import 'dart:async';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'flutter_face_api_client.dart';
@@ -27,12 +28,17 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
   bool _busy = false;
   bool _loggedIn = false;
   bool _capturing = false;
+  bool _monitoringAttendance = false;
+  bool _monitorRequestInFlight = false;
+  Timer? _attendanceMonitorTimer;
+  String? _qualityBeforeMonitor;
+  Uint8List? _monitorPreviousFrame;
 
   String _status = 'Ready';
   String _attendanceStatus = 'No attendance marked yet.';
   AttendanceMarkRead? _lastMarked;
   static const int _attendanceBurstFrames = 2;
-  static const Duration _attendanceBurstGap = Duration(milliseconds: 70);
+  static const Duration _attendanceBurstGap = Duration(milliseconds: 110);
 
   @override
   void initState() {
@@ -87,6 +93,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
 
   @override
   void dispose() {
+    _attendanceMonitorTimer?.cancel();
     _cameraController?.dispose();
     _apiClient?.dispose();
     _baseUrlCtrl.dispose();
@@ -231,9 +238,105 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
     return ' | thr=${threshold.toStringAsFixed(2)}';
   }
 
+  Future<void> _attendanceMonitorTick() async {
+    final client = _apiClient;
+    if (!_monitoringAttendance || _busy || !_loggedIn || client == null || _monitorRequestInFlight) return;
+
+    _monitorRequestInFlight = true;
+    try {
+      final frame = await _captureFrameBytes();
+      if (frame == null || frame.isEmpty) return;
+
+      final previous = _monitorPreviousFrame;
+      _monitorPreviousFrame = frame;
+      if (previous == null || previous.isEmpty) {
+        if (mounted) {
+          setState(() {
+            _attendanceStatus = 'Monitoring live threshold... hold position.';
+          });
+        }
+        return;
+      }
+
+      final result = await client.scanFaceForAttendance(
+        imageBytes: frame,
+        previousImageBytes: previous,
+        deviceId: 'flutter-attendance-monitor',
+        markAttendance: false,
+        fastMode: true,
+        debugTiming: true,
+      );
+
+      final thr = result.livenessThresholdUsed ?? 0.0;
+      final pass = result.livenessThresholdUsed == null
+          ? (result.livenessScore >= 0.0)
+          : (result.livenessScore >= thr);
+
+      if (mounted) {
+        setState(() {
+          _attendanceStatus =
+              'Monitor: live=${result.livenessScore.toStringAsFixed(3)}'
+              '${_thresholdSummary(result.livenessThresholdUsed)}'
+              ' | pass=${pass ? "YES" : "NO"}'
+              ' | conf=${result.confidence.toStringAsFixed(3)}'
+              '${_modelSummary(result.modelUsed)}'
+              '${_timingSummary(result.debugTimings)}'
+              ' | ${result.reason}';
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _attendanceStatus = 'Monitor error: ${_readableError(e)}';
+        });
+      }
+    } finally {
+      _monitorRequestInFlight = false;
+    }
+  }
+
+  Future<void> _setAttendanceMonitoring(bool enabled) async {
+    if (enabled == _monitoringAttendance) return;
+    if (enabled) {
+      _qualityBeforeMonitor = _captureQuality;
+      if (_captureQuality == 'high') {
+        // Keep monitor responsive while preserving enough detail for liveness.
+        await _setCaptureQuality('medium');
+      }
+      _monitoringAttendance = true;
+      _monitorPreviousFrame = null;
+      _attendanceMonitorTimer?.cancel();
+      _attendanceMonitorTimer = Timer.periodic(
+        const Duration(milliseconds: 500),
+        (_) => _attendanceMonitorTick(),
+      );
+      setState(() {
+        _attendanceStatus = 'Live threshold monitoring started.';
+      });
+      return;
+    }
+
+    _monitoringAttendance = false;
+    _attendanceMonitorTimer?.cancel();
+    _attendanceMonitorTimer = null;
+    _monitorPreviousFrame = null;
+    final restoreQuality = _qualityBeforeMonitor;
+    _qualityBeforeMonitor = null;
+    if (restoreQuality != null && restoreQuality != _captureQuality) {
+      await _setCaptureQuality(restoreQuality);
+    }
+    setState(() {
+      _attendanceStatus = 'Live threshold monitoring stopped.';
+    });
+  }
+
   Future<void> _scanAndMarkAttendance() async {
     final client = _apiClient;
     if (_busy || !_loggedIn || client == null) return;
+
+    if (_captureQuality != 'high') {
+      await _setCaptureQuality('high');
+    }
 
     final frames = await _captureBurstFrames(frameCount: 2);
     if (frames.length < 2) {
@@ -253,7 +356,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
         markAttendance: true,
         minVerifiedSamples: 2,
         minConsensusRatio: 0.67,
-        fastMode: false,
+        fastMode: true,
         debugTiming: true,
       );
       if (burst.verified && burst.userId != null && burst.name != null && burst.attendance != null) {
@@ -293,7 +396,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
         markAttendance: true,
         minVerifiedSamples: 2,
         minConsensusRatio: 0.67,
-        fastMode: false,
+        fastMode: true,
         debugTiming: true,
       );
       if (!retry.verified || retry.userId == null || retry.name == null || retry.attendance == null) {
@@ -426,6 +529,26 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
                 child: ElevatedButton(
                   onPressed: _busy || !_loggedIn || !cameraReady ? null : _scanAndMarkAttendance,
                   child: const Text('Scan & Mark Attendance'),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: _busy || !_loggedIn || !cameraReady || _monitoringAttendance
+                      ? null
+                      : () async => _setAttendanceMonitoring(true),
+                  child: const Text('Start Live Monitor'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: _monitoringAttendance ? () async => _setAttendanceMonitoring(false) : null,
+                  child: const Text('Stop Live Monitor'),
                 ),
               ),
             ],

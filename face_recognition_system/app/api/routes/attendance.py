@@ -54,7 +54,8 @@ def scan_face_for_attendance(
             attendance=None,
             debug_timings=None,
         )
-    effective_fast_mode = bool(payload.fast_mode) and (not strict_attendance)
+    # Allow fast embedding path even in strict attendance mode to keep mobile latency low.
+    effective_fast_mode = bool(payload.fast_mode)
     identified = FaceService(db).identify_in_company(
         company_id=current_user.company_id,
         image_base64=payload.image_base64,
@@ -65,7 +66,8 @@ def scan_face_for_attendance(
         fast_mode=effective_fast_mode,
         debug_timing=payload.debug_timing,
         strict_attendance=strict_attendance,
-        allow_bbox_reuse=not strict_attendance,
+        # Reuse bbox across consecutive frames to avoid repeated heavy detection.
+        allow_bbox_reuse=True,
     )
     attendance = None
     if payload.mark_attendance and identified.get("verified") and identified.get("user_id") is not None:
@@ -108,7 +110,8 @@ def scan_face_burst_for_attendance(
     verified_so_far = 0
     previous_bbox: list[int] | None = None
     strict_attendance = bool(payload.mark_attendance)
-    effective_fast_mode = bool(payload.fast_mode) and (not strict_attendance)
+    # Allow fast embedding path even in strict attendance mode to keep mobile latency low.
+    effective_fast_mode = bool(payload.fast_mode)
 
     for idx, image_base64 in enumerate(payload.images_base64):
         result = face_service.identify_in_company(
@@ -122,7 +125,8 @@ def scan_face_burst_for_attendance(
             fast_mode=effective_fast_mode,
             debug_timing=payload.debug_timing,
             strict_attendance=strict_attendance,
-            allow_bbox_reuse=not strict_attendance,
+            # Reuse bbox across consecutive frames to avoid repeated heavy detection.
+            allow_bbox_reuse=True,
         )
         attempts.append(result)
         if isinstance(result.get("_bbox"), list):
