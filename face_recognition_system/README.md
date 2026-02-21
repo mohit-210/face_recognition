@@ -98,3 +98,36 @@ docker compose up --build
   - register face embeddings from multiple uploaded images
   - verify face + liveness from uploaded images
   - filter and inspect verification logs
+
+## Attendance Performance Guardrails
+- Use single-pass attendance mark first; burst fallback only on uncertain results.
+- API responses can include `debug_timings` when `debug_timing=true` in request payload.
+- Production runtime should not use `--reload`; keep one worker for shared model cache.
+- Keep model warmup enabled at startup and monitor latency SLOs:
+  - attendance mark P50 < 2.5s
+  - attendance mark P95 < 5s
+- Recommended weekly checks:
+  - failure reason distribution (`No face`, `Liveness failed`, `Face mismatch`)
+  - median `debug_timings.total_ms` and `debug_timings.detect_ms`
+  - cache hit ratio for company embedding index
+
+## Attendance Anti-Spoof Policy (Balanced)
+- `mark_attendance=true` uses stricter policy than normal identify:
+  - live-motion required
+  - fallback liveness threshold increased
+  - attendance recognition threshold increased
+  - fast mode disabled
+  - minimum 2 verified samples and 67% burst consensus
+- non-attendance identify/preview stays less strict to avoid unnecessary false rejects.
+
+## Passive CNN Calibration
+- Calibration file: `models/passive_antispoof_calibration.json`
+- Retrain + calibrate (inside Docker):
+```bash
+docker compose -f face_recognition_system/docker-compose.yml exec -T api python scripts/train_passive_antispoof.py --data-root datasets/passive_antispoof_bootstrap --out-model models/passive_antispoof_mini_fasnet.keras --out-calibration models/passive_antispoof_calibration.json --epochs 8 --batch-size 32
+```
+- Runtime controls:
+  - `PASSIVE_QUALITY_GATE_ENABLED=false` (default): start CNN in permissive mode, blended with heuristic liveness.
+  - `PASSIVE_QUALITY_GATE_ENABLED=true`: disable CNN if calibration does not meet:
+    - `PASSIVE_CALIBRATION_MAX_EER` (default `0.75`)
+    - `PASSIVE_CALIBRATION_MIN_AUC` (default `0.45`)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,10 +10,37 @@ import numpy as np
 
 from app.core.config import get_settings
 
+STANDALONE_KERAS = None
+STANDALONE_KERAS_IMPORT_ERROR = None
 try:
-    from tensorflow import keras
-except Exception:  # pragma: no cover - runtime dependency may be absent in some dev setups
-    keras = None
+    import keras as STANDALONE_KERAS
+except Exception as exc:  # pragma: no cover - runtime dependency may be absent in some dev setups
+    STANDALONE_KERAS_IMPORT_ERROR = exc
+
+TF_KERAS = None
+TF_KERAS_IMPORT_ERROR = None
+try:
+    from tensorflow import keras as TF_KERAS
+except Exception as exc:  # pragma: no cover - runtime dependency may be absent in some dev setups
+    TF_KERAS_IMPORT_ERROR = exc
+
+LEGACY_TF_KERAS = None
+LEGACY_TF_KERAS_IMPORT_ERROR = None
+try:
+    import tf_keras as LEGACY_TF_KERAS
+except Exception as exc:  # pragma: no cover - runtime dependency may be absent in some dev setups
+    LEGACY_TF_KERAS_IMPORT_ERROR = exc
+
+# Prefer standalone keras for modern `.keras` artifacts.
+keras = STANDALONE_KERAS if STANDALONE_KERAS is not None else (TF_KERAS if TF_KERAS is not None else LEGACY_TF_KERAS)
+KERAS_BACKEND = (
+    "keras"
+    if STANDALONE_KERAS is not None
+    else ("tensorflow.keras" if TF_KERAS is not None else ("tf_keras" if LEGACY_TF_KERAS is not None else "unavailable"))
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -56,29 +84,83 @@ class PassiveAntiSpoofDetector:
         self.settings = get_settings()
         self.model = None
         self.model_ready = False
+        self.calibration_ok = False
         self.calibration: dict = {}
-        model_path = Path(self.settings.passive_antispoof_model_path)
-        calibration_path = Path(self.settings.passive_antispoof_calibration_path)
+        self.model_descriptor = "passive_antispoof_unavailable"
+        self.model_path = Path(self.settings.passive_antispoof_model_path)
+        self.calibration_path = Path(self.settings.passive_antispoof_calibration_path)
+        self._load_attempted = False
+        self._load_components()
 
-        if calibration_path.exists():
+    def _load_components(self) -> None:
+        self._load_attempted = True
+        if self.calibration_path.exists():
             try:
-                self.calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+                self.calibration = json.loads(self.calibration_path.read_text(encoding="utf-8"))
             except Exception:
                 self.calibration = {}
 
-        if model_path.exists() and keras is not None:
-            try:
-                self.model = keras.models.load_model(model_path, compile=False)
-                self.model_ready = True
-            except Exception:
-                self.model = None
+        if self.model_path.exists():
+            loaders: list[tuple[str, object]] = []
+            if STANDALONE_KERAS is not None:
+                loaders.append(("keras", STANDALONE_KERAS))
+            if TF_KERAS is not None:
+                loaders.append(("tensorflow.keras", TF_KERAS))
+            if LEGACY_TF_KERAS is not None:
+                loaders.append(("tf_keras", LEGACY_TF_KERAS))
 
-        # Safety gate: keep passive model disabled when calibration indicates poor quality.
-        if self.model_ready and self.calibration:
+            self.model = None
+            self.model_ready = False
+            if not loaders:
+                logger.warning(
+                    "Passive anti-spoof backend unavailable. keras error=%s ; tensorflow.keras error=%s ; tf_keras error=%s",
+                    STANDALONE_KERAS_IMPORT_ERROR,
+                    TF_KERAS_IMPORT_ERROR,
+                    LEGACY_TF_KERAS_IMPORT_ERROR,
+                )
+            for backend_name, backend in loaders:
+                try:
+                    self.model = backend.models.load_model(self.model_path, compile=False)
+                    self.model_ready = True
+                    model_name = getattr(self.model, "name", "model")
+                    self.model_descriptor = f"{model_name} ({self.model_path.name}) via {backend_name}"
+                    break
+                except Exception:
+                    self.model = None
+                    self.model_ready = False
+                    logger.exception(
+                        "Failed to load passive anti-spoof model from %s via %s",
+                        self.model_path,
+                        backend_name,
+                    )
+        elif not self.model_path.exists():
+            self.model_ready = False
+            logger.warning("Passive anti-spoof model file not found at %s", self.model_path)
+
+        if self.model_ready:
             eer = float(self.calibration.get("eer", 1.0))
             val_auc_best = float(self.calibration.get("val_auc_best", 0.0))
-            if eer > 0.35 or val_auc_best < 0.80:
+            self.calibration_ok = (
+                eer <= float(self.settings.passive_calibration_max_eer)
+                and val_auc_best >= float(self.settings.passive_calibration_min_auc)
+            )
+            if self.settings.passive_quality_gate_enabled and not self.calibration_ok:
                 self.model_ready = False
+                logger.warning(
+                    "Passive anti-spoof disabled by quality gate: eer=%.4f auc=%.4f (max_eer=%.2f min_auc=%.2f)",
+                    eer,
+                    val_auc_best,
+                    float(self.settings.passive_calibration_max_eer),
+                    float(self.settings.passive_calibration_min_auc),
+                )
+            elif not self.calibration_ok:
+                logger.warning(
+                    "Passive anti-spoof running in permissive mode with weak calibration: eer=%.4f auc=%.4f",
+                    eer,
+                    val_auc_best,
+                )
+        else:
+            self.calibration_ok = False
 
     @staticmethod
     def preprocess(face_bgr: np.ndarray, out_size: int = 128) -> np.ndarray:
@@ -115,6 +197,24 @@ class PassiveAntiSpoofDetector:
             return f"Environmental Error: lighting too high ({brightness:.1f})", 0.0
         return None, soft_penalty
 
+    def _apply_threshold_calibration(self, confidence: float) -> float:
+        """
+        Re-map raw model confidence around calibrated EER threshold.
+        Keeps low scores low while expanding headroom for genuine live frames.
+        """
+        thr = float(self.calibration.get("threshold_eer", 0.0))
+        if not (0.05 <= thr <= 0.95):
+            return float(np.clip(confidence, 0.0, 1.0))
+
+        conf = float(np.clip(confidence, 0.0, 1.0))
+        if conf >= thr:
+            # Map [thr..1.0] -> [0.52..1.0]
+            scaled = 0.52 + ((conf - thr) * (0.48 / max(1e-6, (1.0 - thr))))
+        else:
+            # Map [0..thr] -> [0..0.48]
+            scaled = conf * (0.48 / max(1e-6, thr))
+        return float(np.clip(scaled, 0.0, 1.0))
+
     def score(self, face_bgr: np.ndarray) -> PassiveLivenessResult:
         if face_bgr.size == 0:
             return PassiveLivenessResult(confidence=0.0, environmental_error="Environmental Error: empty face crop")
@@ -123,16 +223,26 @@ class PassiveAntiSpoofDetector:
         if env_error:
             return PassiveLivenessResult(confidence=0.0, environmental_error=env_error)
 
+        # Lazy reload prevents permanent fallback if startup happened before model/runtime became available.
+        if (self.model is None or not self.model_ready) and not self._load_attempted:
+            self._load_components()
+        if self.model is None or not self.model_ready:
+            self._load_components()
+
         model = self.model
         if model is None or not self.model_ready:
             return PassiveLivenessResult(
                 confidence=0.0,
-                reason="Passive anti-spoof model unavailable. Train and place model at configured path.",
+                reason=(
+                    "Passive anti-spoof model unavailable. "
+                    f"Ensure model exists at {self.model_path} and runtime has tensorflow.keras or tf_keras."
+                ),
             )
 
         sample = self.preprocess(face_bgr)
         pred = model.predict(np.expand_dims(sample, axis=0), verbose=0)
         confidence = float(np.clip(float(pred.reshape(-1)[0]), 0.0, 1.0))
+        confidence = self._apply_threshold_calibration(confidence)
 
         calibrated_bias = float(self.calibration.get("score_bias", 0.0))
         confidence = float(np.clip(confidence + calibrated_bias - soft_penalty, 0.0, 1.0))

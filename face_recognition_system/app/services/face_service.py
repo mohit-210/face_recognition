@@ -1,4 +1,5 @@
 from functools import lru_cache
+import logging
 import time
 import numpy as np
 import cv2
@@ -13,7 +14,9 @@ from app.vision.detector import FaceDetector
 from app.vision.passive_antispoof import PassiveAntiSpoofDetector
 from app.vision.recognition import RecognitionEngine
 
-COMPANY_INDEX_TTL_SECONDS = 20.0
+logger = logging.getLogger(__name__)
+
+COMPANY_INDEX_TTL_SECONDS = 300.0
 _company_index_cache: dict[int, dict] = {}
 MAX_REGISTER_IMAGES = 12
 REGISTER_DUPLICATE_THRESHOLD_FLOOR = 0.55
@@ -58,6 +61,15 @@ class FaceService:
         )
 
     @staticmethod
+    def _clamp_bbox(bbox: list[int], img_w: int, img_h: int) -> list[int]:
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        x1 = max(0, min(x1, img_w - 1))
+        y1 = max(0, min(y1, img_h - 1))
+        x2 = max(x1 + 1, min(x2, img_w))
+        y2 = max(y1 + 1, min(y2, img_h))
+        return [x1, y1, x2, y2]
+
+    @staticmethod
     def _embedding_failure_hint(face_bgr: np.ndarray) -> str:
         if face_bgr.size == 0:
             return "Face too small/blurred, move closer and hold still."
@@ -77,7 +89,12 @@ class FaceService:
             return "Lighting too harsh, reduce glare and try again."
         return "Face too small/blurred, move closer and hold still."
 
-    def _embed_face_with_retries(self, image_bgr: np.ndarray, bbox: list[int]) -> tuple[np.ndarray | None, str | None]:
+    def _embed_face_with_retries(
+        self,
+        image_bgr: np.ndarray,
+        bbox: list[int],
+        max_candidates: int = 6,
+    ) -> tuple[np.ndarray | None, str | None]:
         # Try a few crop paddings + scales to recover embeddings from borderline frames.
         candidates: list[np.ndarray] = []
         for pad in (0.10, 0.22, 0.34):
@@ -94,7 +111,7 @@ class FaceService:
                     )
                     candidates.append(upscaled)
 
-        for candidate in candidates[:6]:
+        for candidate in candidates[: max(1, int(max_candidates))]:
             try:
                 emb = self.engine.embedder.get_embedding(candidate)
                 return emb, None
@@ -103,6 +120,20 @@ class FaceService:
 
         base_face = self.detector.crop_face(image_bgr, bbox, pad_ratio=0.22)
         return None, self._embedding_failure_hint(base_face)
+
+    @staticmethod
+    def _recommended_embed_candidates(face_bgr: np.ndarray, fast_mode: bool) -> int:
+        if fast_mode:
+            return 2
+        if face_bgr.size == 0:
+            return 4
+        h, w = face_bgr.shape[:2]
+        min_side = min(h, w)
+        gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
+        blur_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        if min_side >= 140 and blur_var >= 45.0:
+            return 3
+        return 5
 
     def _get_company_index(self, company_id: int) -> dict:
         now = time.monotonic()
@@ -326,54 +357,102 @@ class FaceService:
         enforce_liveness: bool = True,
         previous_image_base64: str | None = None,
         require_live_motion: bool = False,
+        previous_bbox: list[int] | None = None,
+        fast_mode: bool = True,
+        debug_timing: bool = False,
+        strict_attendance: bool = False,
+        allow_bbox_reuse: bool = True,
     ) -> dict:
-        image = self.detector.decode_image(image_base64)
-        image = self._resize_for_identify(image, max_side=640)
-        liveness_score = 1.0
-        if not enforce_liveness:
-            detections = self.detector.detect(image)
-            if not detections:
-                return {
+        started = time.perf_counter()
+        timings = {
+            "decode_ms": 0.0,
+            "prev_decode_ms": 0.0,
+            "detect_ms": 0.0,
+            "liveness_ms": 0.0,
+            "embed_ms": 0.0,
+            "index_ms": 0.0,
+            "match_ms": 0.0,
+        }
+
+        def _finish(payload: dict) -> dict:
+            timings["total_ms"] = (time.perf_counter() - started) * 1000.0
+            if debug_timing:
+                payload["debug_timings"] = {k: round(v, 2) for k, v in timings.items()}
+            return payload
+
+        model_used = "none"
+        liveness_threshold_used: float | None = None
+
+        def _fail(reason: str, liveness: float = 0.0, bbox: list[int] | None = None) -> dict:
+            return _finish(
+                {
                     "verified": False,
                     "user_id": None,
                     "name": None,
                     "confidence": 0.0,
-                    "liveness_score": 0.0,
-                    "reason": "No face detected",
+                    "liveness_score": float(liveness),
+                    "liveness_threshold_used": liveness_threshold_used,
+                    "model_used": model_used,
+                    "reason": reason,
+                    "_bbox": bbox,
                 }
+            )
+
+        t0 = time.perf_counter()
+        image = self.detector.decode_image(image_base64)
+        image = self._resize_for_identify(image, max_side=640)
+        timings["decode_ms"] += (time.perf_counter() - t0) * 1000.0
+
+        previous_image = None
+        if previous_image_base64:
+            try:
+                t0 = time.perf_counter()
+                previous_image = self.detector.decode_image(previous_image_base64)
+                previous_image = self._resize_for_identify(previous_image, max_side=640)
+                timings["prev_decode_ms"] += (time.perf_counter() - t0) * 1000.0
+            except ValueError:
+                previous_image = None
+
+        liveness_score = 1.0
+        motion_score = 0.0
+        det = None
+        query_emb = None
+
+        if not enforce_liveness:
+            model_used = "liveness_disabled"
+            t0 = time.perf_counter()
+            detections = self.detector.detect(image)
+            timings["detect_ms"] += (time.perf_counter() - t0) * 1000.0
+            if not detections:
+                return _fail("No face detected")
             det = max(
                 detections,
                 key=lambda d: (d["bbox"][2] - d["bbox"][0]) * (d["bbox"][3] - d["bbox"][1]),
             )
-            query_emb, hint = self._embed_face_with_retries(image, det["bbox"])
+            face = self.detector.crop_face(image, det["bbox"])
+            candidates = self._recommended_embed_candidates(face, fast_mode=fast_mode)
+            t0 = time.perf_counter()
+            query_emb, hint = self._embed_face_with_retries(image, det["bbox"], max_candidates=candidates)
+            timings["embed_ms"] += (time.perf_counter() - t0) * 1000.0
             if query_emb is None:
-                return {
-                    "verified": False,
-                    "user_id": None,
-                    "name": None,
-                    "confidence": 0.0,
-                    "liveness_score": 0.0,
-                    "reason": hint or "Unable to compute embedding",
-                }
+                return _fail(hint or "Unable to compute embedding", bbox=det["bbox"])
         else:
-            previous_image = None
-            if previous_image_base64:
-                try:
-                    previous_image = self.detector.decode_image(previous_image_base64)
-                    previous_image = self._resize_for_identify(previous_image, max_side=640)
-                except ValueError:
-                    previous_image = None
+            detections: list[dict] = []
+            # Reuse recent bbox when available to avoid expensive detector calls on every frame.
+            if allow_bbox_reuse and previous_bbox and len(previous_bbox) == 4:
+                h, w = image.shape[:2]
+                candidate_bbox = self._clamp_bbox(previous_bbox, w, h)
+                reused_face = self.detector.crop_face(image, candidate_bbox, pad_ratio=0.0)
+                if reused_face.size > 0:
+                    detections = [{"bbox": candidate_bbox, "landmarks": {}, "score": 0.99}]
 
-            detections = self.detector.detect(image)
             if not detections:
-                return {
-                    "verified": False,
-                    "user_id": None,
-                    "name": None,
-                    "confidence": 0.0,
-                    "liveness_score": 0.0,
-                    "reason": "No face detected",
-                }
+                t0 = time.perf_counter()
+                detections = self.detector.detect(image)
+                timings["detect_ms"] += (time.perf_counter() - t0) * 1000.0
+
+            if not detections:
+                return _fail("No face detected")
             if len(detections) > 1:
                 ranked = sorted(
                     detections,
@@ -385,22 +464,13 @@ class FaceService:
                 p_area = max(1, (p[2] - p[0]) * (p[3] - p[1]))
                 s_area = max(1, (s[2] - s[0]) * (s[3] - s[1]))
                 if (s_area / float(p_area)) >= 0.35:
-                    return {
-                        "verified": False,
-                        "user_id": None,
-                        "name": None,
-                        "confidence": 0.0,
-                        "liveness_score": 0.0,
-                        "reason": "Clear the Frame: multiple faces detected",
-                    }
+                    return _fail("Clear the Frame: multiple faces detected")
                 detections = [ranked[0]]
 
             det = detections[0]
             face = self.detector.crop_face(image, det["bbox"])
             previous_face = None
             if previous_image is not None:
-                # Reuse current-frame bbox for previous frame to avoid another heavy detector call.
-                # Both frames come from the same camera stream and are close in time.
                 previous_face = self.detector.crop_face(previous_image, det["bbox"])
 
             if previous_face is not None and previous_face.size > 0 and face.size > 0:
@@ -409,82 +479,108 @@ class FaceService:
                     if previous_face.shape[:2] != face.shape[:2]:
                         previous_face = None
 
+            t0 = time.perf_counter()
             passive = self.passive_antispoof.score(face)
             if passive.is_environment_bad:
-                return {
-                    "verified": False,
-                    "user_id": None,
-                    "name": None,
-                    "confidence": 0.0,
-                    "liveness_score": 0.0,
-                    "reason": str(passive.environmental_error),
-                }
+                timings["liveness_ms"] += (time.perf_counter() - t0) * 1000.0
+                return _fail(str(passive.environmental_error), bbox=det["bbox"])
             using_fallback_liveness = passive.reason.startswith("Passive anti-spoof model unavailable")
+            model_used = (
+                "heuristic_liveness_fallback"
+                if using_fallback_liveness
+                else f"{self.passive_antispoof.model_descriptor} + heuristic_liveness"
+            )
             if using_fallback_liveness:
-                liveness_score = float(
+                heuristic_liveness = float(
                     self.engine.liveness.score(
                         face,
                         det.get("landmarks", {}),
                         previous_face_bgr=previous_face,
                     )
                 )
-                # Fallback heuristic is conservative; add a small calibration lift to reduce false rejects.
-                liveness_score = min(1.0, liveness_score + 0.08)
+                liveness_score = heuristic_liveness
+                # Keep fallback calibration conservative; avoid inflating live confidence.
+                liveness_score = min(1.0, liveness_score + 0.02)
             else:
-                liveness_score = float(passive.confidence)
+                heuristic_liveness = float(
+                    self.engine.liveness.score(
+                        face,
+                        det.get("landmarks", {}),
+                        previous_face_bgr=previous_face,
+                    )
+                )
+                # Blend CNN with motion/texture heuristic for stability on imperfect calibrations.
+                liveness_score = float((0.72 * float(passive.confidence)) + (0.28 * heuristic_liveness))
 
-            # Keep motion as a secondary anti-replay signal only when passive model is active.
+            motion_score = float(self.engine.liveness._motion_score(face, previous_face))
+
             if (
                 not using_fallback_liveness
                 and previous_face is not None
                 and previous_face.size > 0
                 and face.size > 0
+                and self._is_rigid_planar_replay(previous_face, face)
             ):
-                if self._is_rigid_planar_replay(previous_face, face):
-                    liveness_score = max(0.0, liveness_score - 0.20)
+                liveness_score = max(0.0, liveness_score - 0.20)
+            timings["liveness_ms"] += (time.perf_counter() - t0) * 1000.0
 
-            required_liveness = self.engine.settings.liveness_threshold
-            if require_live_motion:
-                required_liveness = min(required_liveness, self.engine.settings.attendance_liveness_threshold)
-            elif using_fallback_liveness:
-                required_liveness = min(required_liveness, 0.35)
+            # Use attendance-specific threshold for attendance flows instead of enforcing
+            # the stricter global threshold, which causes unnecessary false rejects.
+            required_liveness = (
+                self.engine.settings.attendance_liveness_threshold
+                if require_live_motion
+                else self.engine.settings.liveness_threshold
+            )
+            if using_fallback_liveness:
+                required_liveness = max(required_liveness, self.engine.settings.fallback_liveness_threshold)
+            liveness_threshold_used = float(required_liveness)
             if liveness_score < required_liveness:
-                reason = "Liveness failed"
-                return {
-                    "verified": False,
-                    "user_id": None,
-                    "name": None,
-                    "confidence": 0.0,
-                    "liveness_score": liveness_score,
-                    "reason": f"{reason} (score={liveness_score:.2f}, threshold={required_liveness:.2f})",
-                }
+                return _fail(
+                    f"Liveness failed (score={liveness_score:.2f}, threshold={required_liveness:.2f})",
+                    liveness=liveness_score,
+                    bbox=det["bbox"],
+                )
+            if require_live_motion and motion_score < self.engine.settings.attendance_min_motion_score:
+                return _fail(
+                    (
+                        "Insufficient live motion "
+                        f"(score={motion_score:.2f}, min={self.engine.settings.attendance_min_motion_score:.2f})"
+                    ),
+                    liveness=liveness_score,
+                    bbox=det["bbox"],
+                )
 
-            query_emb, hint = self._embed_face_with_retries(image, det["bbox"])
+            candidates = self._recommended_embed_candidates(face, fast_mode=fast_mode)
+            t0 = time.perf_counter()
+            query_emb, hint = self._embed_face_with_retries(image, det["bbox"], max_candidates=candidates)
+            timings["embed_ms"] += (time.perf_counter() - t0) * 1000.0
             if query_emb is None:
-                return {
-                    "verified": False,
-                    "user_id": None,
-                    "name": None,
-                    "confidence": 0.0,
-                    "liveness_score": liveness_score,
-                    "reason": hint or "Unable to compute embedding",
-                }
+                return _fail(hint or "Unable to compute embedding", liveness=liveness_score, bbox=det["bbox"])
 
         best_similarity = 0.0
         best_user_id = None
         best_user_name = None
+
+        t0 = time.perf_counter()
         company_index = self._get_company_index(company_id)
+        timings["index_ms"] += (time.perf_counter() - t0) * 1000.0
+
         matrix = company_index.get("embedding_matrix")
         user_ids = company_index.get("embedding_user_ids")
         name_by_user = company_index.get("name_by_user", {})
+        t0 = time.perf_counter()
         if isinstance(matrix, np.ndarray) and isinstance(user_ids, np.ndarray) and matrix.size and user_ids.size:
             scores = matrix.dot(np.asarray(query_emb, dtype=np.float32))
             best_idx = int(np.argmax(scores))
             best_similarity = float(scores[best_idx])
             best_user_id = int(user_ids[best_idx])
             best_user_name = name_by_user.get(best_user_id)
+        timings["match_ms"] += (time.perf_counter() - t0) * 1000.0
 
-        verified = best_user_id is not None and best_similarity >= self.engine.settings.recognition_threshold
+        required_recognition = self.engine.settings.recognition_threshold
+        if strict_attendance:
+            required_recognition = max(required_recognition, self.engine.settings.attendance_recognition_threshold)
+        verified = best_user_id is not None and best_similarity >= required_recognition
         reason = "Verified" if verified else "Face mismatch"
 
         self.log_service.write(
@@ -496,11 +592,26 @@ class FaceService:
             device_id=device_id,
         )
 
-        return {
+        payload = {
             "verified": bool(verified),
             "user_id": best_user_id,
             "name": best_user_name,
             "confidence": float(best_similarity),
             "liveness_score": float(liveness_score),
+            "liveness_threshold_used": liveness_threshold_used,
+            "model_used": model_used,
             "reason": reason,
+            "_bbox": det["bbox"] if det else None,
         }
+        finished = _finish(payload)
+        if debug_timing:
+            logger.info(
+                "attendance-identify company=%s verified=%s total=%.2fms detect=%.2fms liveness=%.2fms embed=%.2fms",
+                company_id,
+                bool(verified),
+                finished["debug_timings"].get("total_ms", 0.0),
+                finished["debug_timings"].get("detect_ms", 0.0),
+                finished["debug_timings"].get("liveness_ms", 0.0),
+                finished["debug_timings"].get("embed_ms", 0.0),
+            )
+        return finished

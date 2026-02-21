@@ -29,9 +29,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
   bool _capturing = false;
 
   String _status = 'Ready';
-  String _attendanceStatus = 'No face matched yet.';
-  String _approvalLabel = 'Approve Attendance';
-  AttendanceScanResponse? _pendingMatch;
+  String _attendanceStatus = 'No attendance marked yet.';
   AttendanceMarkRead? _lastMarked;
   static const int _attendanceBurstFrames = 2;
   static const Duration _attendanceBurstGap = Duration(milliseconds: 70);
@@ -200,108 +198,127 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
     }
   }
 
-  Future<void> _scanFaceForAttendance() async {
-    if (_busy || !_loggedIn || _apiClient == null) return;
+  bool _shouldRetryWithBurst(AttendanceScanResponse result) {
+    if (result.verified) return false;
+    final reason = result.reason.toLowerCase();
+    if (reason.contains('multiple faces')) return false;
+    return reason.contains('no face') ||
+        reason.contains('mismatch') ||
+        reason.contains('liveness') ||
+        reason.contains('embedding') ||
+        result.confidence >= 0.35;
+  }
 
-    final frames = await _captureBurstFrames();
+  String _timingSummary(Map<String, double>? timings) {
+    if (timings == null || timings.isEmpty) return '';
+    final total = timings['total_ms'];
+    final detect = timings['detect_ms'];
+    final live = timings['liveness_ms'];
+    final embed = timings['embed_ms'];
+    return ' | t=${(total ?? 0).toStringAsFixed(0)}ms'
+        ' d=${(detect ?? 0).toStringAsFixed(0)}'
+        ' l=${(live ?? 0).toStringAsFixed(0)}'
+        ' e=${(embed ?? 0).toStringAsFixed(0)}';
+  }
+
+  String _modelSummary(String? modelUsed) {
+    if (modelUsed == null || modelUsed.trim().isEmpty) return '';
+    return ' | model=$modelUsed';
+  }
+
+  String _thresholdSummary(double? threshold) {
+    if (threshold == null) return '';
+    return ' | thr=${threshold.toStringAsFixed(2)}';
+  }
+
+  Future<void> _scanAndMarkAttendance() async {
+    final client = _apiClient;
+    if (_busy || !_loggedIn || client == null) return;
+
+    final frames = await _captureBurstFrames(frameCount: 2);
     if (frames.length < 2) {
-      setState(() => _attendanceStatus = 'Unable to capture enough live frames.');
+      setState(() => _attendanceStatus = 'Need 2 live frames. Hold still and retry.');
       return;
     }
 
     setState(() {
       _busy = true;
-      _attendanceStatus = 'Matching face in company (burst scan)...';
+      _attendanceStatus = 'Checking live face and marking attendance...';
     });
 
     try {
-      final result = await _apiClient!.scanFaceBurstForAttendance(
+      final burst = await client.scanFaceBurstForAttendance(
         imageBytesBurst: frames,
-        deviceId: 'flutter-attendance',
-        markAttendance: false,
-        minVerifiedSamples: 1,
-        minConsensusRatio: 0.60,
-      );
-
-      if (!result.verified || result.userId == null || result.name == null) {
-        setState(() {
-          _pendingMatch = null;
-          _approvalLabel = 'Approve Attendance';
-          _attendanceStatus = result.reason;
-        });
-        return;
-      }
-
-      setState(() {
-        _pendingMatch = result;
-        _approvalLabel = 'Approve Attendance';
-        _attendanceStatus =
-            'Matched: ${result.name} (id=${result.userId}) | conf=${result.confidence.toStringAsFixed(3)}'
-            ' | live=${result.livenessScore.toStringAsFixed(3)}'
-            ' | consensus=${(100 * (result.consensusRatio ?? 0)).toStringAsFixed(0)}%'
-            ' | samples=${result.samplesVerified ?? 0}/${result.samplesEvaluated ?? 0}';
-      });
-    } catch (e) {
-      setState(() {
-        _pendingMatch = null;
-        _attendanceStatus = 'Attendance scan failed: ${_readableError(e)}';
-      });
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  Future<void> _approveAttendance() async {
-    final client = _apiClient;
-    final match = _pendingMatch;
-    if (_busy || !_loggedIn || client == null || match == null || match.userId == null) return;
-
-    setState(() {
-      _busy = true;
-      _attendanceStatus = 'Verifying live face before marking...';
-    });
-
-    try {
-      final frames = await _captureBurstFrames();
-      if (frames.length < 2) {
-        setState(() => _attendanceStatus = 'Unable to capture enough live frames for approval.');
-        return;
-      }
-
-      final approveScan = await client.scanFaceBurstForAttendance(
-        imageBytesBurst: frames,
-        deviceId: 'flutter-attendance-approve',
+        deviceId: 'flutter-attendance-burst-strict',
         markAttendance: true,
-        minVerifiedSamples: 1,
-        minConsensusRatio: 0.60,
+        minVerifiedSamples: 2,
+        minConsensusRatio: 0.67,
+        fastMode: false,
+        debugTiming: true,
       );
-
-      if (
-          !approveScan.verified ||
-          approveScan.userId == null ||
-          approveScan.userId != match.userId ||
-          approveScan.attendance == null) {
+      if (burst.verified && burst.userId != null && burst.name != null && burst.attendance != null) {
+        final marked = burst.attendance!;
         setState(() {
-          _attendanceStatus = approveScan.reason;
+          _lastMarked = marked;
+          _attendanceStatus =
+              'Marked: ${burst.name} | ${marked.action.replaceAll('_', ' ')}'
+              ' | status=${marked.record.status}'
+              ' | conf=${burst.confidence.toStringAsFixed(3)}'
+              ' | live=${burst.livenessScore.toStringAsFixed(3)}'
+              ' | consensus=${(100 * (burst.consensusRatio ?? 0)).toStringAsFixed(0)}%'
+              '${_thresholdSummary(burst.livenessThresholdUsed)}'
+              '${_modelSummary(burst.modelUsed)}'
+              '${_timingSummary(burst.debugTimings)}';
         });
         return;
       }
 
-      final marked = approveScan.attendance!;
-      final action = marked.action.replaceAll('_', ' ');
-      final status = marked.record.status;
+      if (!_shouldRetryWithBurst(burst)) {
+        setState(() {
+          _attendanceStatus = '${burst.reason}${_modelSummary(burst.modelUsed)}${_timingSummary(burst.debugTimings)}';
+        });
+        return;
+      }
+
+      setState(() => _attendanceStatus = 'Retrying with stronger live check...');
+      final retryFrames = await _captureBurstFrames(frameCount: 3);
+      if (retryFrames.length < 2) {
+        setState(() => _attendanceStatus = 'Retry failed: unable to capture enough live frames.');
+        return;
+      }
+
+      final retry = await client.scanFaceBurstForAttendance(
+        imageBytesBurst: retryFrames,
+        deviceId: 'flutter-attendance-burst-retry',
+        markAttendance: true,
+        minVerifiedSamples: 2,
+        minConsensusRatio: 0.67,
+        fastMode: false,
+        debugTiming: true,
+      );
+      if (!retry.verified || retry.userId == null || retry.name == null || retry.attendance == null) {
+        setState(() {
+          _attendanceStatus = '${retry.reason}${_modelSummary(retry.modelUsed)}${_timingSummary(retry.debugTimings)}';
+        });
+        return;
+      }
+
+      final marked = retry.attendance!;
       setState(() {
         _lastMarked = marked;
-        _pendingMatch = null;
-        _approvalLabel = 'Approve Attendance';
         _attendanceStatus =
-            'Marked: ${match.name} | $action | status=$status'
-            ' | conf=${approveScan.confidence.toStringAsFixed(3)}'
-            ' | consensus=${(100 * (approveScan.consensusRatio ?? 0)).toStringAsFixed(0)}%'
-            ' | samples=${approveScan.samplesVerified ?? 0}/${approveScan.samplesEvaluated ?? 0}';
+            'Marked (retry): ${retry.name} | ${marked.action.replaceAll('_', ' ')}'
+            ' | status=${marked.record.status}'
+            ' | conf=${retry.confidence.toStringAsFixed(3)}'
+            ' | live=${retry.livenessScore.toStringAsFixed(3)}'
+            ' | consensus=${(100 * (retry.consensusRatio ?? 0)).toStringAsFixed(0)}%'
+            '${_thresholdSummary(retry.livenessThresholdUsed)}'
+            '${_modelSummary(retry.modelUsed)}'
+            ' | samples=${retry.samplesVerified ?? 0}/${retry.samplesEvaluated ?? 0}'
+            '${_timingSummary(retry.debugTimings)}';
       });
     } catch (e) {
-      setState(() => _attendanceStatus = 'Approve failed: ${_readableError(e)}');
+      setState(() => _attendanceStatus = 'Attendance failed: ${_readableError(e)}');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -398,11 +415,8 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
   }
 
   Widget _buildAttendanceSection(bool cameraReady) {
-    final match = _pendingMatch;
-    final canApprove = match != null && match.userId != null && !_busy && _loggedIn;
-
     return _sectionCard(
-      title: '2) Attendance Approval Flow',
+      title: '2) Attendance Fast Flow',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -410,8 +424,8 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
             children: [
               Expanded(
                 child: ElevatedButton(
-                  onPressed: _busy || !_loggedIn || !cameraReady ? null : _scanFaceForAttendance,
-                  child: const Text('Scan Face (Match Only)'),
+                  onPressed: _busy || !_loggedIn || !cameraReady ? null : _scanAndMarkAttendance,
+                  child: const Text('Scan & Mark Attendance'),
                 ),
               ),
             ],
@@ -419,23 +433,8 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
           const SizedBox(height: 8),
           Text(_attendanceStatus),
           const SizedBox(height: 10),
-          if (match != null) Text('Matched User: ${match.name} (id=${match.userId})'),
           if (_lastMarked != null) Text('Last Mark: ${_lastMarked!.action} -> ${_lastMarked!.record.status}'),
           const SizedBox(height: 10),
-          ElevatedButton(
-            onPressed: canApprove ? _approveAttendance : null,
-            child: Text(_approvalLabel),
-          ),
-          OutlinedButton(
-            onPressed: _busy
-                ? null
-                : () => setState(() {
-                      _pendingMatch = null;
-                      _approvalLabel = 'Approve Attendance';
-                      _attendanceStatus = 'Pending match cleared.';
-                    }),
-            child: const Text('Clear Pending Match'),
-          ),
         ],
       ),
     );

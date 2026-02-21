@@ -4,7 +4,7 @@ services:
   api:
     build: .
     container_name: face_recognition_api
-    command: bash -lc "PYTHONPATH=/app alembic -c alembic.ini upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    command: bash -lc "PYTHONPATH=/app alembic -c alembic.ini upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1"
     volumes:
       - .:/app
     working_dir: /app
@@ -21,8 +21,14 @@ services:
       - JWT_SECRET_KEY=super-secret-change
       - JWT_REFRESH_SECRET_KEY=super-refresh-change
       - RECOGNITION_THRESHOLD=0.45
-      - LIVENESS_THRESHOLD=0.65
+      - LIVENESS_THRESHOLD=0.63
+      - ATTENDANCE_LIVENESS_THRESHOLD=0.60
+      - FALLBACK_LIVENESS_THRESHOLD=0.50
       - SESSION_SECRET_KEY=change-admin-session-secret
+      - OMP_NUM_THREADS=2
+      - OPENBLAS_NUM_THREADS=2
+      - MKL_NUM_THREADS=2
+      - NUMEXPR_NUM_THREADS=2
 
   postgres:
     image: postgres:16

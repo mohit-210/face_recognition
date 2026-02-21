@@ -326,7 +326,7 @@ async function attendanceFromVideo(manual = false) {
   identifyInFlight = true;
 
   try {
-    const blob = await captureBlobFromVideo("attendance-video", { maxWidth: 640, quality: 0.82 });
+    const blob = await captureBlobFromVideo("attendance-video", { maxWidth: 512, quality: 0.78 });
     if (!blob) {
       setAttendanceResult("camera is not ready", "err");
       return false;
@@ -357,16 +357,28 @@ async function attendanceFromVideo(manual = false) {
 
     const data = await res.json();
     attendancePreviousBlob = blob;
+    const modelSuffix = data && data.model_used ? ` | model=${data.model_used}` : "";
+    const thresholdSuffix =
+      data && Number.isFinite(Number(data.liveness_threshold_used))
+        ? ` | thr=${Number(data.liveness_threshold_used).toFixed(2)}`
+        : "";
+    const timeSuffix =
+      data && data.debug_timings && Number.isFinite(Number(data.debug_timings.total_ms))
+        ? ` | t=${Math.round(Number(data.debug_timings.total_ms))}ms`
+        : "";
     if (data.verified && data.name && data.attendance) {
       const action = String(data.attendance.action || "").replaceAll("_", " ");
       const status = data.attendance.status || "";
       attendanceCooldownUntil = Date.now() + ATTENDANCE_SUCCESS_COOLDOWN_MS;
-      setAttendanceResult(`${data.name} | ${action} | status=${status}`, "ok");
+      setAttendanceResult(
+        `${data.name} | ${action} | status=${status}${thresholdSuffix}${modelSuffix}${timeSuffix}`,
+        "ok"
+      );
       setAttendanceCooldown(Math.round(ATTENDANCE_SUCCESS_COOLDOWN_MS / 1000));
       return true;
     }
 
-    setAttendanceResult(data.reason || "Face not recognized", "err");
+    setAttendanceResult(`${data.reason || "Face not recognized"}${modelSuffix}${timeSuffix}`, "err");
     return false;
   } catch {
     setAttendanceResult("unable to contact attendance API", "err");

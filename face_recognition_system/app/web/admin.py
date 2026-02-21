@@ -2,6 +2,7 @@
 
 import base64
 import csv
+import time
 from datetime import date, datetime, timezone
 from io import StringIO
 from pathlib import Path
@@ -75,6 +76,8 @@ class FaceLockManager:
 
 
 _lock_managers: dict[int, FaceLockManager] = {}
+_attendance_bbox_cache: dict[int, dict] = {}
+_ATTENDANCE_BBOX_TTL_SECONDS = 3.0
 
 
 def _get_lock_manager(user_id: int) -> FaceLockManager:
@@ -83,6 +86,27 @@ def _get_lock_manager(user_id: int) -> FaceLockManager:
         manager = FaceLockManager()
         _lock_managers[user_id] = manager
     return manager
+
+
+def _get_recent_attendance_bbox(user_id: int) -> list[int] | None:
+    payload = _attendance_bbox_cache.get(user_id)
+    if not payload:
+        return None
+    ts = float(payload.get("ts", 0.0))
+    if (time.monotonic() - ts) > _ATTENDANCE_BBOX_TTL_SECONDS:
+        _attendance_bbox_cache.pop(user_id, None)
+        return None
+    bbox = payload.get("bbox")
+    if isinstance(bbox, list) and len(bbox) == 4:
+        return [int(v) for v in bbox]
+    return None
+
+
+def _set_recent_attendance_bbox(user_id: int, bbox: list[int] | None) -> None:
+    if not bbox or len(bbox) != 4:
+        _attendance_bbox_cache.pop(user_id, None)
+        return
+    _attendance_bbox_cache[user_id] = {"ts": time.monotonic(), "bbox": [int(v) for v in bbox]}
 
 
 def _redirect(path: str, msg: str = "", error: str = "") -> RedirectResponse:
@@ -862,14 +886,21 @@ def admin_attendance_scan(
     current = _require_admin(request, db)
     image_b64 = _image_to_base64(image)
     previous_b64 = _image_to_base64(previous_image) if previous_image else None
+    previous_bbox = _get_recent_attendance_bbox(current.id)
     identified = FaceService(db).identify_in_company(
         company_id=current.company_id,
         image_base64=image_b64,
         device_id=device_id.strip() or None,
         enforce_liveness=True,
         previous_image_base64=previous_b64,
-        require_live_motion=False,
+        previous_bbox=previous_bbox,
+        require_live_motion=True,
+        fast_mode=True,
+        debug_timing=True,
+        strict_attendance=True,
+        allow_bbox_reuse=True,
     )
+    _set_recent_attendance_bbox(current.id, identified.get("_bbox"))
     if not identified.get("verified") or identified.get("user_id") is None:
         return identified
 

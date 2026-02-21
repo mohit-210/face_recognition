@@ -1,0 +1,68 @@
+{
+  "data_root": "datasets/passive_antispoof_archive_v1",
+  "split": "val",
+  "samples": 195,
+  "live_samples": 65,
+  "spoof_samples": 130,
+  "auc": 0.8120710059171599,
+  "eer": 0.23846153846153847,
+  "thresholds": {
+    "eer_threshold": 0.30136385560035706,
+    "calibration_threshold": 0.30136385560035706,
+    "recommended_threshold_balanced": 0.28
+  },
+  "metrics": {
+    "at_eer_threshold": {
+      "threshold": 0.30136385560035706,
+      "accuracy": 0.764102564102564,
+      "apcer": 0.23076923076923078,
+      "bpcer": 0.24615384615384617,
+      "acer": 0.23846153846153847,
+      "tpr": 0.7538461538461538,
+      "tnr": 0.7692307692307693,
+      "tp": 49.0,
+      "tn": 100.0,
+      "fp": 30.0,
+      "fn": 16.0
+    },
+    "at_calibration_threshold": {
+      "threshold": 0.30136385560035706,
+      "accuracy": 0.764102564102564,
+      "apcer": 0.23076923076923078,
+      "bpcer": 0.24615384615384617,
+      "acer": 0.23846153846153847,
+      "tpr": 0.7538461538461538,
+      "tnr": 0.7692307692307693,
+      "tp": 49.0,
+      "tn": 100.0,
+      "fp": 30.0,
+      "fn": 16.0
+    },
+    "at_0_50_threshold": {
+      "threshold": 0.5,
+      "accuracy": 0.6666666666666666,
+      "apcer": 0.0,
+      "bpcer": 1.0,
+      "acer": 0.5,
+      "tpr": 0.0,
+      "tnr": 1.0,
+      "tp": 0.0,
+      "tn": 130.0,
+      "fp": 0.0,
+      "fn": 65.0
+    },
+    "at_recommended_threshold": {
+      "threshold": 0.28,
+      "accuracy": 0.6461538461538462,
+      "apcer": 0.5230769230769231,
+      "bpcer": 0.015384615384615385,
+      "acer": 0.2692307692307693,
+      "tpr": 0.9846153846153847,
+      "tnr": 0.47692307692307695,
+      "tp": 64.0,
+      "tn": 62.0,
+      "fp": 68.0,
+      "fn": 1.0
+    }
+  }
+}

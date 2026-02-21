@@ -166,11 +166,14 @@ class AttendanceScanResponse {
     required this.name,
     required this.confidence,
     required this.livenessScore,
+    required this.livenessThresholdUsed,
+    required this.modelUsed,
     required this.reason,
     required this.attendance,
     required this.samplesEvaluated,
     required this.samplesVerified,
     required this.consensusRatio,
+    required this.debugTimings,
   });
 
   final bool verified;
@@ -178,19 +181,36 @@ class AttendanceScanResponse {
   final String? name;
   final double confidence;
   final double livenessScore;
+  final double? livenessThresholdUsed;
+  final String? modelUsed;
   final String reason;
   final AttendanceMarkRead? attendance;
   final int? samplesEvaluated;
   final int? samplesVerified;
   final double? consensusRatio;
+  final Map<String, double>? debugTimings;
 
   factory AttendanceScanResponse.fromJson(Map<String, dynamic> json) {
+    Map<String, double>? parseTimings(Object? value) {
+      if (value is! Map) return null;
+      final out = <String, double>{};
+      for (final entry in value.entries) {
+        final v = entry.value;
+        if (v is num) {
+          out[entry.key.toString()] = v.toDouble();
+        }
+      }
+      return out.isEmpty ? null : out;
+    }
+
     return AttendanceScanResponse(
       verified: json['verified'] as bool,
       userId: json['user_id'] as int?,
       name: json['name'] as String?,
       confidence: (json['confidence'] as num).toDouble(),
       livenessScore: (json['liveness_score'] as num).toDouble(),
+      livenessThresholdUsed: (json['liveness_threshold_used'] as num?)?.toDouble(),
+      modelUsed: json['model_used'] as String?,
       reason: json['reason'] as String,
       attendance: json['attendance'] == null
           ? null
@@ -198,6 +218,7 @@ class AttendanceScanResponse {
       samplesEvaluated: json['samples_evaluated'] as int?,
       samplesVerified: json['samples_verified'] as int?,
       consensusRatio: (json['consensus_ratio'] as num?)?.toDouble(),
+      debugTimings: parseTimings(json['debug_timings']),
     );
   }
 }
@@ -353,6 +374,8 @@ class FaceApiClient {
     Uint8List? previousImageBytes,
     String? deviceId,
     bool markAttendance = true,
+    bool fastMode = false,
+    bool debugTiming = false,
   }) async {
     final response = await _sendAuthorized(
       method: 'POST',
@@ -362,6 +385,8 @@ class FaceApiClient {
         'previous_image_base64': previousImageBytes == null ? null : base64Encode(previousImageBytes),
         'device_id': deviceId,
         'mark_attendance': markAttendance,
+        'fast_mode': fastMode,
+        'debug_timing': debugTiming,
       },
     );
     return AttendanceScanResponse.fromJson(_decodeMap(response));
@@ -371,8 +396,10 @@ class FaceApiClient {
     required List<Uint8List> imageBytesBurst,
     String? deviceId,
     bool markAttendance = true,
-    int minVerifiedSamples = 1,
-    double minConsensusRatio = 0.60,
+    int minVerifiedSamples = 2,
+    double minConsensusRatio = 0.67,
+    bool fastMode = false,
+    bool debugTiming = false,
   }) async {
     if (imageBytesBurst.length < 2) {
       throw FaceApiException('At least 2 frames are required for burst attendance scan.');
@@ -389,6 +416,8 @@ class FaceApiClient {
         'mark_attendance': markAttendance,
         'min_verified_samples': minVerifiedSamples,
         'min_consensus_ratio': minConsensusRatio,
+        'fast_mode': fastMode,
+        'debug_timing': debugTiming,
       },
     );
     return AttendanceScanResponse.fromJson(_decodeMap(response));

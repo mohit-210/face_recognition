@@ -44,7 +44,7 @@ class LivenessDetector:
 
     def _challenge_score(self, landmarks: dict, expected: str | None, response: str | None) -> float:
         if not expected:
-            return 0.5
+            return 0.35
         if response and response.lower() == expected.lower():
             return 1.0
         if not landmarks:
@@ -67,7 +67,7 @@ class LivenessDetector:
 
     def _motion_score(self, face_bgr: np.ndarray, previous_face_bgr: np.ndarray | None) -> float:
         if previous_face_bgr is None or previous_face_bgr.size == 0:
-            return 0.6
+            return 0.45
         current_gray = cv2.cvtColor(cv2.resize(face_bgr, (128, 128)), cv2.COLOR_BGR2GRAY)
         prev_gray = cv2.cvtColor(cv2.resize(previous_face_bgr, (128, 128)), cv2.COLOR_BGR2GRAY)
         flow = cv2.absdiff(current_gray, prev_gray)
