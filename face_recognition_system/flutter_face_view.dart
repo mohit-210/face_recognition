@@ -261,6 +261,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
         previousImageBytes: previous,
         deviceId: _monitorDeviceId,
         markAttendance: false,
+        requireLiveMotion: true,
         fastMode: true,
         debugTiming: true,
       );
@@ -348,6 +349,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
         imageBytesBurst: frames,
         deviceId: _monitorDeviceId,
         markAttendance: false,
+        requireLiveMotion: true,
         minVerifiedSamples: 1,
         minConsensusRatio: 0.50,
         fastMode: true,
