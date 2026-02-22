@@ -81,7 +81,7 @@ class PassiveAntiSpoofDetector:
     """
     Passive liveness detector:
     1) environmental pre-check (blur + lighting)
-    2) lightweight CNN inference on frequency/texture-aware channels
+    2) ViT ONNX inference (224x224 + ImageNet norm)
     """
 
     def __init__(self) -> None:
@@ -90,6 +90,7 @@ class PassiveAntiSpoofDetector:
         self.onnx_session = None
         self.onnx_input_name: str | None = None
         self.onnx_output_name: str | None = None
+        self.onnx_input_size: int | None = None
         self.model_ready = False
         self.calibration_ok = False
         self.calibration: dict = {}
@@ -123,12 +124,14 @@ class PassiveAntiSpoofDetector:
                     self.onnx_session = session
                     self.onnx_input_name = inps[0].name
                     self.onnx_output_name = outs[0].name
+                    self.onnx_input_size = self._infer_onnx_input_size(inps[0].shape)
                     self.model_ready = True
-                    self.model_descriptor = f"mini_fasnet_onnx ({self.onnx_path.name}) via onnxruntime"
+                    self.model_descriptor = f"vit_antispoof_onnx ({self.onnx_path.name}) via onnxruntime"
                 except Exception:
                     self.onnx_session = None
                     self.onnx_input_name = None
                     self.onnx_output_name = None
+                    self.onnx_input_size = None
                     self.model_ready = False
                     logger.exception("Failed to load passive anti-spoof ONNX model from %s", self.onnx_path)
 
@@ -200,20 +203,60 @@ class PassiveAntiSpoofDetector:
             self.calibration_ok = False
 
     @staticmethod
-    def preprocess(face_bgr: np.ndarray, out_size: int = 128) -> np.ndarray:
-        resized = cv2.resize(face_bgr, (out_size, out_size), interpolation=cv2.INTER_AREA)
-        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    def _infer_onnx_input_size(shape) -> int | None:
+        if not shape or not isinstance(shape, (list, tuple)):
+            return None
+        dims = [d for d in shape if isinstance(d, int) and d > 0]
+        if len(dims) >= 2:
+            # Prefer square inputs (e.g., 80x80, 128x128).
+            if dims[-1] == dims[-2]:
+                return int(dims[-1])
+        for candidate in (80, 128, 96, 112):
+            if candidate in dims:
+                return candidate
+        return None
 
-        lap = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
-        lap = np.clip(np.abs(lap), 0.0, 1.0)
+    @staticmethod
+    def preprocess(face_bgr: np.ndarray, out_size: int = 224) -> np.ndarray:
+        # ViT PAD: RGB + ImageNet normalization.
+        h, w = face_bgr.shape[:2]
+        interp = cv2.INTER_AREA if (h >= out_size and w >= out_size) else cv2.INTER_CUBIC
+        resized = cv2.resize(face_bgr, (out_size, out_size), interpolation=interp)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        mean = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
+        norm = (rgb - mean) / std
+        chw = np.transpose(norm, (2, 0, 1))
+        return np.expand_dims(chw, axis=0).astype(np.float32)
 
-        fft = np.fft.fft2(gray)
-        fft_shift = np.fft.fftshift(fft)
-        magnitude = np.log1p(np.abs(fft_shift))
-        magnitude = magnitude / (float(np.max(magnitude)) + 1e-6)
+    @staticmethod
+    def _scaled_bbox(bbox: list[int], scale: float, img_w: int, img_h: int) -> list[int]:
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        w = max(1, x2 - x1)
+        h = max(1, y2 - y1)
+        cx = x1 + (w / 2.0)
+        cy = y1 + (h / 2.0)
+        side = max(w, h) * float(scale)
+        nx1 = int(round(cx - side / 2.0))
+        ny1 = int(round(cy - side / 2.0))
+        nx2 = int(round(cx + side / 2.0))
+        ny2 = int(round(cy + side / 2.0))
+        nx1 = max(0, min(nx1, img_w - 1))
+        ny1 = max(0, min(ny1, img_h - 1))
+        nx2 = max(nx1 + 1, min(nx2, img_w))
+        ny2 = max(ny1 + 1, min(ny2, img_h))
+        return [nx1, ny1, nx2, ny2]
 
-        stacked = np.stack([gray, lap, magnitude.astype(np.float32)], axis=-1).astype(np.float32)
-        return stacked
+    @staticmethod
+    def _crop_scaled(image_bgr: np.ndarray, bbox: list[int], scale: float) -> np.ndarray:
+        h, w = image_bgr.shape[:2]
+        x1, y1, x2, y2 = PassiveAntiSpoofDetector._scaled_bbox(bbox, scale, w, h)
+        crop = image_bgr[y1:y2, x1:x2]
+        return crop
+
+    @staticmethod
+    def _preprocess_celeba(face_bgr: np.ndarray, out_size: int) -> np.ndarray:
+        return PassiveAntiSpoofDetector.preprocess(face_bgr, out_size=out_size)
 
     @staticmethod
     def _enhance_luma(face_bgr: np.ndarray) -> np.ndarray:
@@ -275,9 +318,12 @@ class PassiveAntiSpoofDetector:
         if arr.size == 0:
             return 0.0
 
-        # Scalar/binary output.
+        # Scalar/binary output (single logit).
         if arr.ndim == 0 or (arr.ndim == 1 and arr.shape[0] == 1):
-            return float(np.clip(arr.reshape(-1)[0], 0.0, 1.0))
+            val = float(arr.reshape(-1)[0])
+            if 0.0 <= val <= 1.0:
+                return float(val)
+            return float(1.0 / (1.0 + np.exp(-val)))
 
         if arr.ndim == 1:
             vec = arr
@@ -302,7 +348,17 @@ class PassiveAntiSpoofDetector:
             live_idx = min(1, probs.shape[0] - 1)
         return float(np.clip(float(probs[live_idx]), 0.0, 1.0))
 
-    def score(self, face_bgr: np.ndarray) -> PassiveLivenessResult:
+    def score_from_image(
+        self,
+        image_bgr: np.ndarray,
+        bbox: list[int],
+        face_bgr: np.ndarray | None = None,
+    ) -> PassiveLivenessResult:
+        if image_bgr.size == 0:
+            return PassiveLivenessResult(confidence=0.0, environmental_error="Environmental Error: empty image")
+
+        if face_bgr is None or face_bgr.size == 0:
+            face_bgr = self._crop_scaled(image_bgr, bbox, scale=1.0)
         if face_bgr.size == 0:
             return PassiveLivenessResult(confidence=0.0, environmental_error="Environmental Error: empty face crop")
 
@@ -328,51 +384,59 @@ class PassiveAntiSpoofDetector:
             )
 
         # Base prediction first.
-        preprocess_size = int(self.settings.passive_antispoof_onnx_input_size) if onnx_session is not None else 128
-        sample = self.preprocess(face_bgr, out_size=preprocess_size)
         if onnx_session is not None and self.onnx_input_name and self.onnx_output_name:
-            # MiniFASNet ONNX exports are channel-first (NCHW).
-            onnx_input = np.expand_dims(sample, axis=0).astype(np.float32).transpose(0, 3, 1, 2)
+            preprocess_size = int(self.onnx_input_size or self.settings.passive_antispoof_onnx_input_size or 224)
+            crop = self._crop_scaled(image_bgr, bbox, scale=2.5)
+            if crop.size == 0:
+                crop = face_bgr
+            onnx_input = self._preprocess_celeba(crop, out_size=preprocess_size)
             pred = onnx_session.run(
                 [self.onnx_output_name],
                 {self.onnx_input_name: onnx_input},
             )[0]
             base_conf = self._onnx_to_live_confidence(pred)
         else:
-            pred = model.predict(np.expand_dims(sample, axis=0), verbose=0)
+            preprocess_size = 224
+            sample = self.preprocess(face_bgr, out_size=preprocess_size)
+            pred = model.predict(sample, verbose=0)
             base_conf = float(np.clip(float(np.asarray(pred).reshape(-1)[0]), 0.0, 1.0))
 
         # Boundary-focused TTA: only run extra views when score is ambiguous.
         confidence = base_conf
         if 0.30 <= base_conf <= 0.75:
-            face_flip = cv2.flip(face_bgr, 1)
-            face_luma = self._enhance_luma(face_bgr)
-            tta_batch = np.stack(
-                [
-                    sample,
-                    self.preprocess(face_flip, out_size=preprocess_size),
-                    self.preprocess(face_luma, out_size=preprocess_size),
-                ],
-                axis=0,
-            )
             if onnx_session is not None and self.onnx_input_name and self.onnx_output_name:
-                # MiniFASNet ONNX exports are channel-first (NCHW).
-                onnx_tta_input = tta_batch.astype(np.float32).transpose(0, 3, 1, 2)
-                tta_pred = onnx_session.run(
-                    [self.onnx_output_name],
-                    {self.onnx_input_name: onnx_tta_input},
-                )[0]
-                tta_raw = np.asarray(tta_pred)
-                if tta_raw.ndim >= 2:
-                    tta_scores = [
-                        self._onnx_to_live_confidence(tta_raw[i : i + 1]) for i in range(int(tta_raw.shape[0]))
-                    ]
-                    tta_pred = np.asarray(tta_scores, dtype=np.float32).reshape(-1)
-                else:
-                    tta_pred = np.asarray([self._onnx_to_live_confidence(tta_raw)], dtype=np.float32)
+                preprocess_size = int(self.onnx_input_size or self.settings.passive_antispoof_onnx_input_size or 224)
+                crop = self._crop_scaled(image_bgr, bbox, scale=2.5)
+                if crop.size == 0:
+                    crop = face_bgr
+                face_flip = cv2.flip(crop, 1)
+                face_luma = self._enhance_luma(crop)
+                tta_inputs = [
+                    self._preprocess_celeba(crop, out_size=preprocess_size),
+                    self._preprocess_celeba(face_flip, out_size=preprocess_size),
+                    self._preprocess_celeba(face_luma, out_size=preprocess_size),
+                ]
+                preds = []
+                for inp in tta_inputs:
+                    pred = onnx_session.run(
+                        [self.onnx_output_name],
+                        {self.onnx_input_name: inp},
+                    )[0]
+                    preds.append(self._onnx_to_live_confidence(pred))
+                confidence = float(np.clip(float(np.mean(preds)), 0.0, 1.0))
             else:
+                face_flip = cv2.flip(face_bgr, 1)
+                face_luma = self._enhance_luma(face_bgr)
+                tta_batch = np.concatenate(
+                    [
+                        sample,
+                        self.preprocess(face_flip, out_size=preprocess_size),
+                        self.preprocess(face_luma, out_size=preprocess_size),
+                    ],
+                    axis=0,
+                )
                 tta_pred = model.predict(tta_batch, verbose=0).reshape(-1)
-            confidence = float(np.clip(float(np.mean(tta_pred)), 0.0, 1.0))
+                confidence = float(np.clip(float(np.mean(tta_pred)), 0.0, 1.0))
 
         confidence = self._apply_threshold_calibration(confidence)
 
@@ -380,3 +444,9 @@ class PassiveAntiSpoofDetector:
         confidence = float(np.clip(confidence + calibrated_bias - soft_penalty, 0.0, 1.0))
 
         return PassiveLivenessResult(confidence=confidence, reason="passive_inference")
+
+    def score(self, face_bgr: np.ndarray) -> PassiveLivenessResult:
+        # Backwards-compatible fallback for callers that only have a face crop.
+        if face_bgr.size == 0:
+            return PassiveLivenessResult(confidence=0.0, environmental_error="Environmental Error: empty face crop")
+        return self.score_from_image(face_bgr, [0, 0, face_bgr.shape[1], face_bgr.shape[0]], face_bgr=face_bgr)

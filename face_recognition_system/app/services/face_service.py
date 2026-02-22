@@ -483,7 +483,7 @@ class FaceService:
                         previous_face = None
 
             t0 = time.perf_counter()
-            passive = self.passive_antispoof.score(face)
+            passive = self.passive_antispoof.score_from_image(image, det["bbox"], face_bgr=face)
             if passive.is_environment_bad:
                 timings["liveness_ms"] += (time.perf_counter() - t0) * 1000.0
                 return _fail(str(passive.environmental_error), bbox=det["bbox"])

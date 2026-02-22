@@ -12,9 +12,19 @@ services:
     working_dir: /app
     ports:
       - "8000:8000"
+    # GPU enablement (Docker Desktop + NVIDIA drivers required)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     depends_on:
       - postgres
     environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - DB_HOST=postgres
       - DB_PORT=5432
       - DB_NAME=face_db
@@ -30,9 +40,10 @@ services:
       - ARCFACE_DET_SIZE=640
       - RETINAFACE_MIN_SCORE=0.70
       - PASSIVE_ANTISPOOF_BACKEND=auto
-      - PASSIVE_ANTISPOOF_ONNX_PATH=./models/passive_antispoof.onnx
-      - PASSIVE_ANTISPOOF_ONNX_INPUT_SIZE=128
-      - PASSIVE_ANTISPOOF_ONNX_LIVE_INDEX=0
+      - PASSIVE_ANTISPOOF_ONNX_PATH=./models/vit_antispoof.onnx
+      - PASSIVE_ANTISPOOF_ONNX_INPUT_SIZE=224
+      - PASSIVE_ANTISPOOF_ONNX_LIVE_INDEX=1
+      - PASSIVE_ANTISPOOF_CALIBRATION_PATH=./models/vit_antispoof_calibration.json
       - SESSION_SECRET_KEY=change-admin-session-secret
       - OMP_NUM_THREADS=2
       - OPENBLAS_NUM_THREADS=2
