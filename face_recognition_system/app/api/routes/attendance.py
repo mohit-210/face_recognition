@@ -41,7 +41,7 @@ def scan_face_for_attendance(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    strict_attendance = bool(payload.require_live_motion) if payload.require_live_motion is not None else bool(payload.mark_attendance)
+    strict_attendance = bool(payload.mark_attendance)
     if strict_attendance and not payload.previous_image_base64:
         return AttendanceScanResponse(
             verified=False,
@@ -110,7 +110,7 @@ def scan_face_burst_for_attendance(
     total_samples = len(payload.images_base64)
     verified_so_far = 0
     previous_bbox: list[int] | None = None
-    strict_attendance = bool(payload.require_live_motion) if payload.require_live_motion is not None else bool(payload.mark_attendance)
+    strict_attendance = bool(payload.mark_attendance)
     # Allow fast embedding path even in strict attendance mode to keep mobile latency low.
     effective_fast_mode = bool(payload.fast_mode)
 

@@ -31,9 +31,8 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
   bool _monitoringAttendance = false;
   bool _monitorRequestInFlight = false;
   Timer? _attendanceMonitorTimer;
+  String? _qualityBeforeMonitor;
   Uint8List? _monitorPreviousFrame;
-  DateTime? _lastMonitorTickAt;
-  static const Duration _monitorMinGap = Duration(milliseconds: 650);
 
   String _status = 'Ready';
   String _attendanceStatus = 'No attendance marked yet.';
@@ -41,9 +40,8 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
   int? _activeCompanyId;
   AttendanceMarkRead? _lastMarked;
   AttendanceScanResponse? _pendingAttendanceCandidate;
-  static const int _attendanceBurstFrames = 3;
+  static const int _attendanceBurstFrames = 2;
   static const Duration _attendanceBurstGap = Duration(milliseconds: 110);
-  static const double _minMarkConfidence = 0.55;
   static const String _monitorDeviceId = 'flutter-attendance-monitor';
   static const String _burstStrictDeviceId = 'flutter-attendance-burst-strict';
   static const String _burstRetryDeviceId = 'flutter-attendance-burst-retry';
@@ -241,12 +239,6 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
   Future<void> _attendanceMonitorTick() async {
     final client = _apiClient;
     if (!_monitoringAttendance || _busy || !_loggedIn || client == null || _monitorRequestInFlight) return;
-    final now = DateTime.now();
-    final lastTickAt = _lastMonitorTickAt;
-    if (lastTickAt != null && now.difference(lastTickAt) < _monitorMinGap) {
-      return;
-    }
-    _lastMonitorTickAt = now;
 
     _monitorRequestInFlight = true;
     try {
@@ -269,7 +261,6 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
         previousImageBytes: previous,
         deviceId: _monitorDeviceId,
         markAttendance: false,
-        requireLiveMotion: true,
         fastMode: true,
         debugTiming: true,
       );
@@ -278,30 +269,24 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
       final pass = result.livenessThresholdUsed == null
           ? (result.livenessScore >= 0.0)
           : (result.livenessScore >= thr);
-      final nextStatus =
-          'Monitor: live=${result.livenessScore.toStringAsFixed(3)}'
-          '${_thresholdSummary(result.livenessThresholdUsed)}'
-          ' | pass=${pass ? "YES" : "NO"}'
-          ' | conf=${result.confidence.toStringAsFixed(3)}'
-          '${_modelSummary(result.modelUsed)}'
-          '${_timingSummary(result.debugTimings)}'
-          ' | ${result.reason}';
 
       if (mounted) {
-        if (_attendanceStatus != nextStatus) {
-          setState(() {
-            _attendanceStatus = nextStatus;
-          });
-        }
+        setState(() {
+          _attendanceStatus =
+              'Monitor: live=${result.livenessScore.toStringAsFixed(3)}'
+              '${_thresholdSummary(result.livenessThresholdUsed)}'
+              ' | pass=${pass ? "YES" : "NO"}'
+              ' | conf=${result.confidence.toStringAsFixed(3)}'
+              '${_modelSummary(result.modelUsed)}'
+              '${_timingSummary(result.debugTimings)}'
+              ' | ${result.reason}';
+        });
       }
     } catch (e) {
       if (mounted) {
-        final nextStatus = 'Monitor error: ${_readableError(e)}';
-        if (_attendanceStatus != nextStatus) {
-          setState(() {
-            _attendanceStatus = nextStatus;
-          });
-        }
+        setState(() {
+          _attendanceStatus = 'Monitor error: ${_readableError(e)}';
+        });
       }
     } finally {
       _monitorRequestInFlight = false;
@@ -311,12 +296,16 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
   Future<void> _setAttendanceMonitoring(bool enabled) async {
     if (enabled == _monitoringAttendance) return;
     if (enabled) {
+      _qualityBeforeMonitor = _captureQuality;
+      if (_captureQuality == 'high') {
+        // Keep monitor responsive while preserving enough detail for liveness.
+        await _setCaptureQuality('medium');
+      }
       _monitoringAttendance = true;
       _monitorPreviousFrame = null;
-      _lastMonitorTickAt = null;
       _attendanceMonitorTimer?.cancel();
       _attendanceMonitorTimer = Timer.periodic(
-        const Duration(milliseconds: 700),
+        const Duration(milliseconds: 500),
         (_) => _attendanceMonitorTick(),
       );
       setState(() {
@@ -329,98 +318,73 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
     _attendanceMonitorTimer?.cancel();
     _attendanceMonitorTimer = null;
     _monitorPreviousFrame = null;
-    _lastMonitorTickAt = null;
+    final restoreQuality = _qualityBeforeMonitor;
+    _qualityBeforeMonitor = null;
+    if (restoreQuality != null && restoreQuality != _captureQuality) {
+      await _setCaptureQuality(restoreQuality);
+    }
     setState(() {
       _attendanceStatus = 'Live threshold monitoring stopped.';
     });
-  }
-
-  Future<T> _runWithMonitorPaused<T>(Future<T> Function() action) async {
-    final wasMonitoring = _monitoringAttendance;
-    if (wasMonitoring) {
-      await _setAttendanceMonitoring(false);
-    }
-    try {
-      return await action();
-    } finally {
-      if (wasMonitoring && mounted) {
-        await _setAttendanceMonitoring(true);
-      }
-    }
   }
 
   Future<void> _scanFaceForAttendance() async {
     final client = _apiClient;
     if (_busy || !_loggedIn || client == null) return;
 
-    await _runWithMonitorPaused(() async {
-      final frames = await _captureBurstFrames(frameCount: _attendanceBurstFrames);
-      if (frames.length < _attendanceBurstFrames) {
+    final frames = await _captureBurstFrames(frameCount: 2);
+    if (frames.length < 2) {
+      setState(() => _attendanceStatus = 'Need 2 live frames. Hold still and retry.');
+      return;
+    }
+
+    setState(() {
+      _busy = true;
+      _attendanceStatus = 'Scanning face (no mark yet)...';
+    });
+
+    try {
+      final burst = await client.scanFaceBurstForAttendance(
+        imageBytesBurst: frames,
+        deviceId: _monitorDeviceId,
+        markAttendance: false,
+        minVerifiedSamples: 1,
+        minConsensusRatio: 0.50,
+        fastMode: true,
+        debugTiming: true,
+      );
+      if (burst.verified && burst.userId != null && burst.name != null) {
         setState(() {
-          _attendanceStatus = 'Need $_attendanceBurstFrames live frames. Hold still and retry.';
+          _pendingAttendanceCandidate = burst;
+          _attendanceStatus =
+              'Verified: ${burst.name} (not marked yet)'
+              ' | conf=${burst.confidence.toStringAsFixed(3)}'
+              ' | live=${burst.livenessScore.toStringAsFixed(3)}'
+              '${_thresholdSummary(burst.livenessThresholdUsed)}'
+              '${_modelSummary(burst.modelUsed)}'
+              '${_timingSummary(burst.debugTimings)}';
         });
         return;
       }
 
       setState(() {
-        _busy = true;
-        _attendanceStatus = 'Scanning face (no mark yet)...';
+        _pendingAttendanceCandidate = null;
+        _attendanceStatus = '${burst.reason}${_modelSummary(burst.modelUsed)}${_timingSummary(burst.debugTimings)}';
       });
-
-      try {
-        final burst = await client.scanFaceBurstForAttendance(
-          imageBytesBurst: frames,
-          deviceId: _monitorDeviceId,
-          markAttendance: false,
-          requireLiveMotion: true,
-          minVerifiedSamples: 1,
-          minConsensusRatio: 0.50,
-          fastMode: true,
-          debugTiming: true,
-        );
-        if (burst.verified && burst.userId != null && burst.name != null) {
-          final confOk = burst.confidence >= _minMarkConfidence;
-          setState(() {
-            _pendingAttendanceCandidate = burst;
-            _attendanceStatus =
-                '${confOk ? "Verified" : "Low confidence"}: ${burst.name} (not marked yet)'
-                ' | conf=${burst.confidence.toStringAsFixed(3)}'
-                ' | min_conf=${_minMarkConfidence.toStringAsFixed(2)}'
-                ' | live=${burst.livenessScore.toStringAsFixed(3)}'
-                '${_thresholdSummary(burst.livenessThresholdUsed)}'
-                '${_modelSummary(burst.modelUsed)}'
-                '${_timingSummary(burst.debugTimings)}';
-          });
-          return;
-        }
-
-        setState(() {
-          _pendingAttendanceCandidate = null;
-          _attendanceStatus = '${burst.reason}${_modelSummary(burst.modelUsed)}${_timingSummary(burst.debugTimings)}';
-        });
-      } catch (e) {
-        setState(() {
-          _pendingAttendanceCandidate = null;
-          _attendanceStatus = 'Attendance scan failed: ${_readableError(e)}';
-        });
-      } finally {
-        if (mounted) setState(() => _busy = false);
-      }
-    });
+    } catch (e) {
+      setState(() {
+        _pendingAttendanceCandidate = null;
+        _attendanceStatus = 'Attendance scan failed: ${_readableError(e)}';
+      });
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   Future<void> _markVerifiedAttendance() async {
     final client = _apiClient;
     final pending = _pendingAttendanceCandidate;
     if (_busy || !_loggedIn || client == null || pending == null || pending.userId == null || pending.name == null) {
-      return;
-    }
-    if (pending.confidence < _minMarkConfidence) {
-      setState(() {
-        _attendanceStatus =
-            'Cannot mark attendance: conf=${pending.confidence.toStringAsFixed(3)} '
-            '< min_conf=${_minMarkConfidence.toStringAsFixed(2)}. Please scan again.';
-      });
       return;
     }
 
@@ -434,27 +398,26 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
     //   return;
     // }
 
-    await _runWithMonitorPaused(() async {
-      setState(() {
-        _busy = true;
-        _attendanceStatus = 'Marking attendance for ${pending.name}...';
-      });
+    setState(() {
+      _busy = true;
+      _attendanceStatus = 'Marking attendance for ${pending.name}...';
+    });
 
-      try {
-        final marked = await client.markVerifiedAttendance(userId: pending.userId!);
-        setState(() {
-          _lastMarked = marked;
-          _pendingAttendanceCandidate = null;
-          _attendanceStatus =
-              'Marked: ${pending.name} | ${marked.action.replaceAll('_', ' ')}'
-              ' | status=${marked.record.status}'
-              ' | from pre-scan'
-              ' | conf=${pending.confidence.toStringAsFixed(3)}'
-              ' | live=${pending.livenessScore.toStringAsFixed(3)}'
-              '${_thresholdSummary(pending.livenessThresholdUsed)}'
-              '${_modelSummary(pending.modelUsed)}'
-              '${_timingSummary(pending.debugTimings)}';
-        });
+    try {
+      final marked = await client.markVerifiedAttendance(userId: pending.userId!);
+      setState(() {
+        _lastMarked = marked;
+        _pendingAttendanceCandidate = null;
+        _attendanceStatus =
+            'Marked: ${pending.name} | ${marked.action.replaceAll('_', ' ')}'
+            ' | status=${marked.record.status}'
+            ' | from pre-scan'
+            ' | conf=${pending.confidence.toStringAsFixed(3)}'
+            ' | live=${pending.livenessScore.toStringAsFixed(3)}'
+            '${_thresholdSummary(pending.livenessThresholdUsed)}'
+            '${_modelSummary(pending.modelUsed)}'
+            '${_timingSummary(pending.debugTimings)}';
+      });
 
       // Old strict re-check before marking (kept intentionally as requested):
       // final burst = await client.scanFaceBurstForAttendance(
@@ -490,12 +453,11 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
       //       'Mark failed: ${burst.reason}${_modelSummary(burst.modelUsed)}${_timingSummary(burst.debugTimings)}. '
       //       'Please scan again.';
       // });
-      } catch (e) {
-        setState(() => _attendanceStatus = 'Attendance mark failed: ${_readableError(e)}');
-      } finally {
-        if (mounted) setState(() => _busy = false);
-      }
-    });
+    } catch (e) {
+      setState(() => _attendanceStatus = 'Attendance mark failed: ${_readableError(e)}');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   String _readableError(Object error) {
@@ -601,10 +563,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
 
   Widget _buildAttendanceSection(bool cameraReady) {
     final pending = _pendingAttendanceCandidate;
-    final canMarkPending = pending != null
-        && pending.userId != null
-        && pending.name != null
-        && pending.confidence >= _minMarkConfidence;
+    final canMarkPending = pending != null && pending.userId != null && pending.name != null;
     return _sectionCard(
       title: '2) Attendance Two-Step Flow',
       child: Column(
