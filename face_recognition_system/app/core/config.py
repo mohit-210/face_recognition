@@ -22,8 +22,8 @@ class Settings(BaseSettings):
     session_secret_key: str = "change-admin-session-secret"
 
     recognition_threshold: float = Field(default=0.45, ge=0.0, le=1.0)
-    liveness_threshold: float = Field(default=0.63, ge=0.0, le=1.0)
-    attendance_liveness_threshold: float = Field(default=0.60, ge=0.0, le=1.0)
+    liveness_threshold: float = Field(default=0.77, ge=0.0, le=1.0)
+    attendance_liveness_threshold: float = Field(default=0.77, ge=0.0, le=1.0)
     attendance_recognition_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
     fallback_liveness_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
     attendance_min_motion_score: float = Field(default=0.52, ge=0.0, le=1.0)
