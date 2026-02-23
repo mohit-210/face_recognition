@@ -140,6 +140,17 @@ def scan_face_burst_for_attendance(
             verified_so_far += 1
         previous_image_base64 = image_base64
 
+        # Fast-exit for lightweight mobile verify flows:
+        # once we have the minimum 1 verified sample and relaxed consensus policy,
+        # additional frames only add latency with little value.
+        if (
+            not strict_attendance
+            and min_verified_samples <= 1
+            and min_consensus_ratio <= 0.50
+            and verified_so_far >= 1
+        ):
+            break
+
         remaining = total_samples - (idx + 1)
         if verified_so_far + remaining < min_verified_samples:
             break

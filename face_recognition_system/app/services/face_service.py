@@ -425,6 +425,7 @@ class FaceService:
 
         liveness_score = 1.0
         blink_score = 0.0
+        blink_passed = False
         motion_score = 0.0
         motion_diff = 0.0
         det = None
@@ -574,7 +575,9 @@ class FaceService:
                 # over passive anti-spoof score drift on CPU fallback.
                 blink_pass_threshold = 0.65 if mobile_mode else 0.80
                 if blink_score >= blink_pass_threshold:
-                    liveness_score = max(float(liveness_score), 0.82)
+                    blink_passed = True
+                    # Report a meaningful live score when explicit blink is observed.
+                    liveness_score = max(float(liveness_score), float(blink_score))
                     model_used = f"{model_used} + blink_challenge"
                 else:
                     return _fail(
@@ -588,7 +591,7 @@ class FaceService:
             if using_fallback_liveness:
                 required_liveness = max(required_liveness, self.engine.settings.fallback_liveness_threshold)
             liveness_threshold_used = float(required_liveness)
-            if liveness_score < required_liveness:
+            if (not blink_passed) and (liveness_score < required_liveness):
                 return _fail(
                     f"Liveness failed (score={liveness_score:.2f}, threshold={required_liveness:.2f})",
                     liveness=liveness_score,

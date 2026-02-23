@@ -4,7 +4,20 @@ import 'dart:ui' as ui;
 import 'dart:io';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'flutter_face_api_client.dart';
+
+class _BlinkFrameSample {
+  _BlinkFrameSample({
+    required this.bytes,
+    this.leftEyeOpen,
+    this.rightEyeOpen,
+  });
+
+  final Uint8List bytes;
+  final double? leftEyeOpen;
+  final double? rightEyeOpen;
+}
 
 class FaceOpsPage extends StatefulWidget {
   const FaceOpsPage({super.key});
@@ -25,9 +38,16 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
   String _captureQuality = 'medium';
 
   FaceApiClient? _apiClient;
+  final FaceDetector _blinkFaceDetector = FaceDetector(
+    options: FaceDetectorOptions(
+      enableClassification: true,
+      performanceMode: FaceDetectorMode.fast,
+    ),
+  );
 
   bool _initializingCamera = false;
   bool _busy = false;
+  bool _verifyApiInFlight = false;
   bool _loggedIn = false;
   bool _capturing = false;
   bool _monitoringAttendance = false;
@@ -46,11 +66,14 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
   static const int _attendanceBurstFrames = 2;
   static const Duration _attendanceBurstGap = Duration(milliseconds: 110);
   static const int _mobileFrameMaxWidth = 512;
-  static const int _blinkBurstFramesOpen = 2;
-  static const int _blinkBurstFramesBlink = 3;
-  static const Duration _blinkOpenGap = Duration(milliseconds: 95);
-  static const Duration _blinkActionGap = Duration(milliseconds: 95);
-  static const Duration _blinkLeadDelay = Duration(milliseconds: 220);
+  static const int _blinkBurstFramesOpen = 1;
+  static const int _blinkBurstFramesBlink = 1;
+  static const Duration _blinkOpenGap = Duration(milliseconds: 80);
+  static const Duration _blinkActionGap = Duration(milliseconds: 80);
+  static const Duration _blinkLeadDelay = Duration(milliseconds: 120);
+  static const Duration _blinkDetectWindow = Duration(seconds: 6);
+  static const double _eyeOpenThreshold = 0.68;
+  static const double _eyeClosedThreshold = 0.38;
   static const String _monitorDeviceId = 'flutter-attendance-monitor';
   static const String _verifyBlinkDeviceId = 'flutter-mobile-blink';
   static const String _burstStrictDeviceId = 'flutter-attendance-burst-strict';
@@ -112,6 +135,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
     _attendanceMonitorTimer?.cancel();
     _cameraController?.dispose();
     _apiClient?.dispose();
+    _blinkFaceDetector.close();
     _baseUrlCtrl.dispose();
     _companyIdCtrl.dispose();
     _adminCodeCtrl.dispose();
@@ -169,14 +193,65 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
     }
   }
 
+  Future<_BlinkFrameSample?> _captureBlinkSample() async {
+    final controller = _cameraController;
+    if (controller == null || !controller.value.isInitialized) return null;
+    if (_capturing) return null;
+
+    _capturing = true;
+    try {
+      final file = await controller.takePicture();
+      final bytes = await file.readAsBytes();
+      final normalized = await _normalizeFrameBytes(bytes, maxWidth: _mobileFrameMaxWidth);
+      double? leftEyeOpen;
+      double? rightEyeOpen;
+      try {
+        final inputImage = InputImage.fromFilePath(file.path);
+        final faces = await _blinkFaceDetector.processImage(inputImage);
+        if (faces.isNotEmpty) {
+          leftEyeOpen = faces.first.leftEyeOpenProbability;
+          rightEyeOpen = faces.first.rightEyeOpenProbability;
+        }
+      } catch (_) {
+        // Detection can fail on some frames; caller handles retry.
+      }
+      return _BlinkFrameSample(
+        bytes: normalized,
+        leftEyeOpen: leftEyeOpen,
+        rightEyeOpen: rightEyeOpen,
+      );
+    } catch (_) {
+      return null;
+    } finally {
+      _capturing = false;
+    }
+  }
+
+  bool _isEyesOpen(_BlinkFrameSample sample) {
+    final l = sample.leftEyeOpen ?? 0.0;
+    final r = sample.rightEyeOpen ?? 0.0;
+    return l >= _eyeOpenThreshold && r >= _eyeOpenThreshold;
+  }
+
+  bool _isEyesClosed(_BlinkFrameSample sample) {
+    final l = sample.leftEyeOpen ?? 1.0;
+    final r = sample.rightEyeOpen ?? 1.0;
+    return l <= _eyeClosedThreshold || r <= _eyeClosedThreshold;
+  }
+
   Future<Uint8List> _normalizeFrameBytes(Uint8List bytes, {int maxWidth = _mobileFrameMaxWidth}) async {
     try {
+      // Disable expensive client-side transcode at normal mobile width; backend already resizes.
+      if (maxWidth >= 512) {
+        return bytes;
+      }
       final codec = await ui.instantiateImageCodec(bytes);
       final frame = await codec.getNextFrame();
       final image = frame.image;
       final srcW = image.width;
       final srcH = image.height;
       if (srcW <= 0 || srcH <= 0) return bytes;
+      if (srcW <= maxWidth) return bytes;
 
       final targetW = srcW <= maxWidth ? srcW : maxWidth;
       final scale = targetW / srcW;
@@ -436,40 +511,78 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
 
     setState(() {
       _busy = true;
-      _verifyStatus = 'Blink verify: hold eyes open...';
+      _verifyStatus = 'Blink verify: keep eyes open...';
     });
 
     try {
-      final openFrames = await _captureBurstFrames(
-        frameCount: _blinkBurstFramesOpen,
-        frameGap: _blinkOpenGap,
-        maxWidth: _mobileFrameMaxWidth,
-      );
-      if (openFrames.length < _blinkBurstFramesOpen) {
-        setState(() => _verifyStatus = 'Blink verify failed: could not capture stable open-eye frames.');
-        return;
-      }
-      setState(() => _verifyStatus = 'Now blink once...');
-      await Future<void>.delayed(_blinkLeadDelay);
-      final blinkFrames = await _captureBurstFrames(
-        frameCount: _blinkBurstFramesBlink,
-        frameGap: _blinkActionGap,
-        maxWidth: _mobileFrameMaxWidth,
-      );
-      final burst = <Uint8List>[...openFrames, ...blinkFrames];
-      if (burst.length < 4) {
-        setState(() => _verifyStatus = 'Blink verify failed: not enough frames captured.');
-        return;
+      _BlinkFrameSample? openSample;
+      bool sawProbabilities = false;
+      final deadline = DateTime.now().add(_blinkDetectWindow);
+      int attempts = 0;
+      AttendanceScanResponse? result;
+
+      while (DateTime.now().isBefore(deadline)) {
+        attempts += 1;
+        final sample = await _captureBlinkSample();
+        if (sample == null || sample.bytes.isEmpty) {
+          await Future<void>.delayed(_blinkActionGap);
+          continue;
+        }
+
+        final hasProb = sample.leftEyeOpen != null && sample.rightEyeOpen != null;
+        sawProbabilities = sawProbabilities || hasProb;
+
+        if (openSample == null) {
+          if (_isEyesOpen(sample)) {
+            openSample = sample;
+            setState(() => _verifyStatus = 'Open eyes detected. Blink now...');
+          } else {
+            setState(() => _verifyStatus = 'Align face and keep eyes open...');
+          }
+          await Future<void>.delayed(_blinkOpenGap);
+          continue;
+        }
+
+        if (_isEyesClosed(sample)) {
+          setState(() => _verifyStatus = 'Blink captured. Verifying, please wait...');
+          setState(() => _verifyApiInFlight = true);
+          result = await _scanFaceForAttendanceWithBlink(
+            client: client,
+            imageBytes: sample.bytes,
+            previousImageBytes: openSample.bytes,
+          );
+          if (mounted) {
+            setState(() => _verifyApiInFlight = false);
+          }
+          break;
+        }
+
+        if (_isEyesOpen(sample)) {
+          openSample = sample; // refresh baseline for better transition matching
+        }
+        setState(() => _verifyStatus = 'Waiting for blink...');
+        await Future<void>.delayed(_blinkActionGap);
       }
 
-      final result = await _scanFaceForAttendanceWithBlink(
-        client: client,
-        imageBytesBurst: burst,
-      );
+      if (result == null) {
+        if (!sawProbabilities) {
+          setState(
+            () => _verifyStatus =
+                'Blink detect unavailable on this device frame. Keep better lighting and face centered, then retry.',
+          );
+        } else {
+          setState(
+            () => _verifyStatus =
+                'Blink not detected in ${_blinkDetectWindow.inSeconds}s (samples=$attempts). '
+                'Keep face stable, eyes open first, then blink once.',
+          );
+        }
+        return;
+      }
 
       setState(() {
         _verifyStatus =
-            '${result.verified ? "VERIFIED" : "REJECTED"}'
+            '${result!.verified ? "VERIFIED" : "REJECTED"}'
             ' | conf=${result.confidence.toStringAsFixed(3)}'
             ' | live=${result.livenessScore.toStringAsFixed(3)}'
             '${_thresholdSummary(result.livenessThresholdUsed)}'
@@ -481,21 +594,22 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
     } catch (e) {
       setState(() => _verifyStatus = 'Blink verify failed: ${_readableError(e)}');
     } finally {
+      if (mounted) setState(() => _verifyApiInFlight = false);
       if (mounted) setState(() => _busy = false);
     }
   }
 
   Future<AttendanceScanResponse> _scanFaceForAttendanceWithBlink({
     required FaceApiClient client,
-    required List<Uint8List> imageBytesBurst,
+    required Uint8List imageBytes,
+    required Uint8List previousImageBytes,
   }) async {
-    return client.scanFaceBurstForAttendance(
-      imageBytesBurst: imageBytesBurst,
+    return client.scanFaceForAttendance(
+      imageBytes: imageBytes,
+      previousImageBytes: previousImageBytes,
       deviceId: _verifyBlinkDeviceId,
       markAttendance: false,
       expectedChallenge: 'blink',
-      minVerifiedSamples: 1,
-      minConsensusRatio: 0.50,
       fastMode: true,
       debugTiming: true,
     );
@@ -693,6 +807,16 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
             onPressed: _busy || !_loggedIn || !cameraReady ? null : _verifyWithBlink,
             child: const Text('Verify With Blink'),
           ),
+          if (_verifyApiInFlight) ...[
+            const SizedBox(height: 10),
+            const Center(
+              child: SizedBox(
+                width: 22,
+                height: 22,
+                child: CircularProgressIndicator(strokeWidth: 2.6),
+              ),
+            ),
+          ],
           const SizedBox(height: 8),
           Text(_verifyStatus),
         ],
