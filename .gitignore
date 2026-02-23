@@ -1,0 +1,52 @@
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Env files / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+*.out
+*.err
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Project-specific local artifacts
+face_recognition_system/.venv/
+face_recognition_system/data/
+face_recognition_system/server.out
+face_recognition_system/server.err
+
+# Flutter / Dart generated files (if Flutter app is added here)
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+**/build/
+
