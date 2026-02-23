@@ -1,5 +1,7 @@
-﻿import cv2
+import cv2
 import numpy as np
+
+_EYE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye_tree_eyeglasses.xml")
 
 
 class LivenessDetector:
@@ -7,7 +9,7 @@ class LivenessDetector:
     Multi-signal liveness scoring:
     1) texture realism with Laplacian variance
     2) edge-noise consistency for screen/photo detection
-    3) challenge response (left/right/up/down)
+    3) challenge response (left/right/up/down/blink)
     4) frame-to-frame motion depth cue
     """
 
@@ -21,7 +23,13 @@ class LivenessDetector:
     ) -> float:
         texture = self._texture_score(face_bgr)
         moire = self._moire_penalty(face_bgr)
-        challenge = self._challenge_score(landmarks, expected_challenge, challenge_response)
+        challenge = self._challenge_score(
+            face_bgr,
+            landmarks,
+            expected_challenge,
+            challenge_response,
+            previous_face_bgr=previous_face_bgr,
+        )
         motion = self._motion_score(face_bgr, previous_face_bgr)
 
         # Keep motion as a weaker signal so stable real users are not rejected too aggressively.
@@ -42,11 +50,57 @@ class LivenessDetector:
         # Strong repeated high-frequency patterns can indicate display replay.
         return float(min(1.0, high_freq_energy / 22.0))
 
-    def _challenge_score(self, landmarks: dict, expected: str | None, response: str | None) -> float:
+    @staticmethod
+    def _eye_open_score(face_bgr: np.ndarray) -> float:
+        if face_bgr.size == 0:
+            return 0.0
+        gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
+        h = gray.shape[0]
+        roi = cv2.equalizeHist(gray[: max(1, int(h * 0.62)), :])
+        eyes = _EYE_CASCADE.detectMultiScale(
+            roi,
+            scaleFactor=1.1,
+            minNeighbors=4,
+            minSize=(12, 12),
+        )
+        eye_count = min(2, len(eyes)) if eyes is not None else 0
+        return float(eye_count) / 2.0
+
+    def _blink_challenge_score(self, face_bgr: np.ndarray, previous_face_bgr: np.ndarray | None) -> float:
+        if previous_face_bgr is None or previous_face_bgr.size == 0:
+            return 0.0
+
+        prev_open = self._eye_open_score(previous_face_bgr)
+        curr_open = self._eye_open_score(face_bgr)
+        was_open = prev_open >= 0.60
+        now_closed = curr_open <= 0.35
+        dropped = (prev_open - curr_open) >= 0.45
+
+        if was_open and now_closed:
+            return 1.0
+        if was_open and dropped:
+            return 0.80
+        if now_closed:
+            return 0.45
+        return 0.0
+
+    def _challenge_score(
+        self,
+        face_bgr: np.ndarray,
+        landmarks: dict,
+        expected: str | None,
+        response: str | None,
+        previous_face_bgr: np.ndarray | None = None,
+    ) -> float:
         if not expected:
             return 0.35
         if response and response.lower() == expected.lower():
             return 1.0
+
+        expected_norm = expected.lower().strip()
+        if expected_norm == "blink":
+            return self._blink_challenge_score(face_bgr, previous_face_bgr)
+
         if not landmarks:
             return 0.0
 
@@ -59,9 +113,9 @@ class LivenessDetector:
         eye_center_x = (left_eye[0] + right_eye[0]) / 2
         delta_x = nose[0] - eye_center_x
 
-        if expected.lower() == "left" and delta_x < -4:
+        if expected_norm == "left" and delta_x < -4:
             return 1.0
-        if expected.lower() == "right" and delta_x > 4:
+        if expected_norm == "right" and delta_x > 4:
             return 1.0
         return 0.0
 

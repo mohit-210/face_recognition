@@ -868,18 +868,38 @@ def verify_face(
 def identify_face(
     request: Request,
     image: UploadFile = File(...),
+    previous_image: UploadFile | None = File(default=None),
     device_id: str = Form(default="admin-web"),
     fast_mode: bool = Form(default=True),
+    expected_challenge: str = Form(default=""),
+    challenge_response: str = Form(default=""),
     db: Session = Depends(get_db),
 ):
     current = _require_admin(request, db)
     image_b64 = _image_to_base64(image)
+    previous_b64 = _image_to_base64(previous_image) if previous_image else None
+    expected_norm = expected_challenge.strip().lower()
+    if expected_norm == "blink" and not previous_b64:
+        return {
+            "verified": False,
+            "user_id": None,
+            "name": None,
+            "confidence": 0.0,
+            "liveness_score": 0.0,
+            "liveness_threshold_used": None,
+            "model_used": "liveness_disabled" if bool(fast_mode) else None,
+            "reason": "Blink challenge initializing, hold steady and blink on next frame",
+        }
     previous_bbox = _get_recent_identify_bbox(current.id)
+    enforce_liveness = (not bool(fast_mode)) or (expected_norm == "blink")
     result = FaceService(db).identify_in_company(
         company_id=current.company_id,
         image_base64=image_b64,
         device_id=device_id.strip() or None,
-        enforce_liveness=not bool(fast_mode),
+        previous_image_base64=previous_b64,
+        expected_challenge=(expected_norm or None),
+        challenge_response=(challenge_response.strip() or None),
+        enforce_liveness=enforce_liveness,
         previous_bbox=previous_bbox,
         fast_mode=bool(fast_mode),
         allow_bbox_reuse=True,

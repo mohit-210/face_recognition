@@ -11,6 +11,7 @@ const focusPoint = {
 };
 let identifyInFlight = false;
 let attendancePreviousBlob = null;
+let verifyPreviousBlob = null;
 let lastAttendanceResultMessage = "waiting for scan";
 let lastAttendanceResultState = "";
 
@@ -286,6 +287,19 @@ async function identifyFromVideo() {
     form.append("image", new File([blob], `identify_${Date.now()}.jpg`, { type: "image/jpeg" }));
     form.append("device_id", "admin-web-live");
     form.append("fast_mode", "true");
+    const blinkRequired = Boolean(document.getElementById("verify-blink-required")?.checked);
+    if (blinkRequired) {
+      if (!verifyPreviousBlob) {
+        verifyPreviousBlob = blob;
+        setVerifyResult("blink challenge initializing, blink on next frame");
+        return false;
+      }
+      form.append(
+        "previous_image",
+        new File([verifyPreviousBlob], `identify_prev_${Date.now()}.jpg`, { type: "image/jpeg" })
+      );
+      form.append("expected_challenge", "blink");
+    }
 
     const res = await fetch("/admin/face/identify", {
       method: "POST",
@@ -298,6 +312,7 @@ async function identifyFromVideo() {
     }
 
     const data = await res.json();
+    verifyPreviousBlob = blob;
     if (data.verified && data.name) {
       setVerifyResult(`Verified: ${data.name} (${Math.round((data.confidence || 0) * 100)}%)`, "ok");
       return true;
@@ -535,6 +550,7 @@ async function startMonitoring(mode) {
   setGuidance(mode, "Monitoring started. Center your face in the guide frame.", false, 0, 0);
   setLockState(mode, "searching", false);
   if (mode === "verify") {
+    verifyPreviousBlob = null;
     setVerifyResult("scanning face...");
     setGuidance(mode, "Instant identify mode active.", true, 1, 0);
     setLockState(mode, "instant", true);
@@ -592,6 +608,9 @@ function stopMonitoring(mode) {
   clearOverlay(mode);
   if (mode === "attendance") {
     attendancePreviousBlob = null;
+  }
+  if (mode === "verify") {
+    verifyPreviousBlob = null;
   }
 }
 

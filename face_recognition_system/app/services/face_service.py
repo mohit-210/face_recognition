@@ -362,6 +362,8 @@ class FaceService:
         device_id: str | None,
         enforce_liveness: bool = True,
         previous_image_base64: str | None = None,
+        expected_challenge: str | None = None,
+        challenge_response: str | None = None,
         require_live_motion: bool = False,
         previous_bbox: list[int] | None = None,
         fast_mode: bool = True,
@@ -422,6 +424,7 @@ class FaceService:
                 previous_image = None
 
         liveness_score = 1.0
+        blink_score = 0.0
         motion_score = 0.0
         motion_diff = 0.0
         det = None
@@ -515,6 +518,8 @@ class FaceService:
                     self.engine.liveness.score(
                         face,
                         det.get("landmarks", {}),
+                        expected_challenge=expected_challenge,
+                        challenge_response=challenge_response,
                         previous_face_bgr=previous_face,
                     )
                 )
@@ -526,6 +531,8 @@ class FaceService:
                     self.engine.liveness.score(
                         face,
                         det.get("landmarks", {}),
+                        expected_challenge=expected_challenge,
+                        challenge_response=challenge_response,
                         previous_face_bgr=previous_face,
                     )
                 )
@@ -536,6 +543,9 @@ class FaceService:
                     liveness_score = float((0.80 * float(passive.confidence)) + (0.20 * heuristic_liveness))
 
             motion_score = float(self.engine.liveness._motion_score(face, previous_face))
+            expected_challenge_norm = (expected_challenge or "").strip().lower()
+            if expected_challenge_norm == "blink":
+                blink_score = float(self.engine.liveness._blink_challenge_score(face, previous_face))
             if previous_face is not None and previous_face.size > 0 and face.size > 0:
                 curr_gray = cv2.cvtColor(cv2.resize(face, (128, 128)), cv2.COLOR_BGR2GRAY)
                 prev_gray = cv2.cvtColor(cv2.resize(previous_face, (128, 128)), cv2.COLOR_BGR2GRAY)
@@ -559,6 +569,22 @@ class FaceService:
                 if require_live_motion
                 else self.engine.settings.liveness_threshold
             )
+            if expected_challenge_norm == "blink":
+                # For explicit blink challenge, prioritize observed blink transition
+                # over passive anti-spoof score drift on CPU fallback.
+                blink_pass_threshold = 0.65 if mobile_mode else 0.80
+                if blink_score >= blink_pass_threshold:
+                    liveness_score = max(float(liveness_score), 0.82)
+                    model_used = f"{model_used} + blink_challenge"
+                else:
+                    return _fail(
+                        (
+                            f"Blink not detected (score={blink_score:.2f}, "
+                            f"threshold={blink_pass_threshold:.2f}); keep eyes open, then blink once"
+                        ),
+                        liveness=liveness_score,
+                        bbox=det["bbox"],
+                    )
             if using_fallback_liveness:
                 required_liveness = max(required_liveness, self.engine.settings.fallback_liveness_threshold)
             liveness_threshold_used = float(required_liveness)

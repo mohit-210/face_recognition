@@ -1,5 +1,7 @@
 import 'dart:typed_data';
 import 'dart:async';
+import 'dart:ui' as ui;
+import 'dart:io';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'flutter_face_api_client.dart';
@@ -12,7 +14,7 @@ class FaceOpsPage extends StatefulWidget {
 }
 
 class _FaceOpsPageState extends State<FaceOpsPage> {
-  final TextEditingController _baseUrlCtrl = TextEditingController(text: 'http://localhost:8000');
+  final TextEditingController _baseUrlCtrl = TextEditingController(text: 'http://192.168.1.69:8000');
   final TextEditingController _companyIdCtrl = TextEditingController();
   final TextEditingController _adminCodeCtrl = TextEditingController();
   final TextEditingController _adminPasswordCtrl = TextEditingController();
@@ -35,6 +37,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
   Uint8List? _monitorPreviousFrame;
 
   String _status = 'Ready';
+  String _verifyStatus = 'No verification run yet.';
   String _attendanceStatus = 'No attendance marked yet.';
   String? _activeBaseUrl;
   int? _activeCompanyId;
@@ -42,7 +45,14 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
   AttendanceScanResponse? _pendingAttendanceCandidate;
   static const int _attendanceBurstFrames = 2;
   static const Duration _attendanceBurstGap = Duration(milliseconds: 110);
+  static const int _mobileFrameMaxWidth = 512;
+  static const int _blinkBurstFramesOpen = 2;
+  static const int _blinkBurstFramesBlink = 3;
+  static const Duration _blinkOpenGap = Duration(milliseconds: 95);
+  static const Duration _blinkActionGap = Duration(milliseconds: 95);
+  static const Duration _blinkLeadDelay = Duration(milliseconds: 220);
   static const String _monitorDeviceId = 'flutter-attendance-monitor';
+  static const String _verifyBlinkDeviceId = 'flutter-mobile-blink';
   static const String _burstStrictDeviceId = 'flutter-attendance-burst-strict';
   static const String _burstRetryDeviceId = 'flutter-attendance-burst-retry';
 
@@ -141,7 +151,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
     await _initCamera();
   }
 
-  Future<Uint8List?> _captureFrameBytes() async {
+  Future<Uint8List?> _captureFrameBytes({int maxWidth = _mobileFrameMaxWidth}) async {
     final controller = _cameraController;
     if (controller == null || !controller.value.isInitialized) return null;
     if (_capturing) return null;
@@ -150,7 +160,8 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
 
     try {
       final file = await controller.takePicture();
-      return await file.readAsBytes();
+      final bytes = await file.readAsBytes();
+      return await _normalizeFrameBytes(bytes, maxWidth: maxWidth);
     } catch (_) {
       return null;
     } finally {
@@ -158,13 +169,39 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
     }
   }
 
+  Future<Uint8List> _normalizeFrameBytes(Uint8List bytes, {int maxWidth = _mobileFrameMaxWidth}) async {
+    try {
+      final codec = await ui.instantiateImageCodec(bytes);
+      final frame = await codec.getNextFrame();
+      final image = frame.image;
+      final srcW = image.width;
+      final srcH = image.height;
+      if (srcW <= 0 || srcH <= 0) return bytes;
+
+      final targetW = srcW <= maxWidth ? srcW : maxWidth;
+      final scale = targetW / srcW;
+      final targetH = (srcH * scale).round().clamp(1, 4096);
+      final resizedCodec = await ui.instantiateImageCodec(
+        bytes,
+        targetWidth: targetW,
+        targetHeight: targetH,
+      );
+      final resizedFrame = await resizedCodec.getNextFrame();
+      final out = await resizedFrame.image.toByteData(format: ui.ImageByteFormat.png);
+      return out?.buffer.asUint8List() ?? bytes;
+    } catch (_) {
+      return bytes;
+    }
+  }
+
   Future<List<Uint8List>> _captureBurstFrames({
     int frameCount = _attendanceBurstFrames,
     Duration frameGap = _attendanceBurstGap,
+    int maxWidth = _mobileFrameMaxWidth,
   }) async {
     final frames = <Uint8List>[];
     for (var i = 0; i < frameCount; i++) {
-      final frame = await _captureFrameBytes();
+      final frame = await _captureFrameBytes(maxWidth: maxWidth);
       if (frame == null || frame.isEmpty) {
         continue;
       }
@@ -192,6 +229,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
 
     try {
       final client = FaceApiClient(baseUrl: _baseUrlCtrl.text.trim());
+      _baseUrlCtrl.text = client.baseUrl;
       await client.login(
         companyId: companyId,
         employeeCode: _adminCodeCtrl.text.trim(),
@@ -207,6 +245,14 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
         _activeCompanyId = companyId;
         _status = 'Login successful | url=${client.baseUrl} | company_id=$companyId';
       });
+    } on SocketException catch (e) {
+      setState(() {
+        _status =
+            'Login failed: cannot reach ${_baseUrlCtrl.text}. '
+            'Ensure API is running and phone/laptop are on same Wi-Fi. ($e)';
+      });
+    } on FaceApiException catch (e) {
+      setState(() => _status = 'Login failed: ${e.message} (code=${e.statusCode ?? "-"})');
     } catch (e) {
       setState(() => _status = 'Login failed: $e');
     } finally {
@@ -242,7 +288,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
 
     _monitorRequestInFlight = true;
     try {
-      final frame = await _captureFrameBytes();
+      final frame = await _captureFrameBytes(maxWidth: _mobileFrameMaxWidth);
       if (frame == null || frame.isEmpty) return;
 
       final previous = _monitorPreviousFrame;
@@ -305,7 +351,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
       _monitorPreviousFrame = null;
       _attendanceMonitorTimer?.cancel();
       _attendanceMonitorTimer = Timer.periodic(
-        const Duration(milliseconds: 500),
+        const Duration(milliseconds: 380),
         (_) => _attendanceMonitorTick(),
       );
       setState(() {
@@ -332,7 +378,10 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
     final client = _apiClient;
     if (_busy || !_loggedIn || client == null) return;
 
-    final frames = await _captureBurstFrames(frameCount: 2);
+    final frames = await _captureBurstFrames(
+      frameCount: 2,
+      maxWidth: _mobileFrameMaxWidth,
+    );
     if (frames.length < 2) {
       setState(() => _attendanceStatus = 'Need 2 live frames. Hold still and retry.');
       return;
@@ -379,6 +428,77 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
     } finally {
       if (mounted) setState(() => _busy = false);
     }
+  }
+
+  Future<void> _verifyWithBlink() async {
+    final client = _apiClient;
+    if (_busy || !_loggedIn || client == null) return;
+
+    setState(() {
+      _busy = true;
+      _verifyStatus = 'Blink verify: hold eyes open...';
+    });
+
+    try {
+      final openFrames = await _captureBurstFrames(
+        frameCount: _blinkBurstFramesOpen,
+        frameGap: _blinkOpenGap,
+        maxWidth: _mobileFrameMaxWidth,
+      );
+      if (openFrames.length < _blinkBurstFramesOpen) {
+        setState(() => _verifyStatus = 'Blink verify failed: could not capture stable open-eye frames.');
+        return;
+      }
+      setState(() => _verifyStatus = 'Now blink once...');
+      await Future<void>.delayed(_blinkLeadDelay);
+      final blinkFrames = await _captureBurstFrames(
+        frameCount: _blinkBurstFramesBlink,
+        frameGap: _blinkActionGap,
+        maxWidth: _mobileFrameMaxWidth,
+      );
+      final burst = <Uint8List>[...openFrames, ...blinkFrames];
+      if (burst.length < 4) {
+        setState(() => _verifyStatus = 'Blink verify failed: not enough frames captured.');
+        return;
+      }
+
+      final result = await _scanFaceForAttendanceWithBlink(
+        client: client,
+        imageBytesBurst: burst,
+      );
+
+      setState(() {
+        _verifyStatus =
+            '${result.verified ? "VERIFIED" : "REJECTED"}'
+            ' | conf=${result.confidence.toStringAsFixed(3)}'
+            ' | live=${result.livenessScore.toStringAsFixed(3)}'
+            '${_thresholdSummary(result.livenessThresholdUsed)}'
+            '${_modelSummary(result.modelUsed)}'
+            '${_timingSummary(result.debugTimings)}'
+            '${result.name != null ? " | user=${result.name}" : ""}'
+            ' | ${result.reason}';
+      });
+    } catch (e) {
+      setState(() => _verifyStatus = 'Blink verify failed: ${_readableError(e)}');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<AttendanceScanResponse> _scanFaceForAttendanceWithBlink({
+    required FaceApiClient client,
+    required List<Uint8List> imageBytesBurst,
+  }) async {
+    return client.scanFaceBurstForAttendance(
+      imageBytesBurst: imageBytesBurst,
+      deviceId: _verifyBlinkDeviceId,
+      markAttendance: false,
+      expectedChallenge: 'blink',
+      minVerifiedSamples: 1,
+      minConsensusRatio: 0.50,
+      fastMode: true,
+      debugTiming: true,
+    );
   }
 
   Future<void> _markVerifiedAttendance() async {
@@ -516,6 +636,8 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
                 children: [
                   _buildLoginSection(),
                   const SizedBox(height: 12),
+                  _buildVerifySection(cameraReady),
+                  const SizedBox(height: 12),
                   _buildAttendanceSection(cameraReady),
                   const SizedBox(height: 12),
                   Align(
@@ -561,11 +683,28 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
     );
   }
 
+  Widget _buildVerifySection(bool cameraReady) {
+    return _sectionCard(
+      title: '2) Auto Verify (Blink)',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          ElevatedButton(
+            onPressed: _busy || !_loggedIn || !cameraReady ? null : _verifyWithBlink,
+            child: const Text('Verify With Blink'),
+          ),
+          const SizedBox(height: 8),
+          Text(_verifyStatus),
+        ],
+      ),
+    );
+  }
+
   Widget _buildAttendanceSection(bool cameraReady) {
     final pending = _pendingAttendanceCandidate;
     final canMarkPending = pending != null && pending.userId != null && pending.name != null;
     return _sectionCard(
-      title: '2) Attendance Two-Step Flow',
+      title: '3) Attendance Two-Step Flow',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [

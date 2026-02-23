@@ -374,6 +374,8 @@ class FaceApiClient {
     Uint8List? previousImageBytes,
     String? deviceId,
     bool markAttendance = true,
+    String? expectedChallenge,
+    String? challengeResponse,
     bool fastMode = true,
     bool debugTiming = false,
   }) async {
@@ -385,6 +387,8 @@ class FaceApiClient {
         'previous_image_base64': previousImageBytes == null ? null : base64Encode(previousImageBytes),
         'device_id': deviceId,
         'mark_attendance': markAttendance,
+        'expected_challenge': expectedChallenge,
+        'challenge_response': challengeResponse,
         'fast_mode': fastMode,
         'debug_timing': debugTiming,
       },
@@ -396,6 +400,8 @@ class FaceApiClient {
     required List<Uint8List> imageBytesBurst,
     String? deviceId,
     bool markAttendance = true,
+    String? expectedChallenge,
+    String? challengeResponse,
     int minVerifiedSamples = 2,
     double minConsensusRatio = 0.67,
     bool fastMode = true,
@@ -414,6 +420,8 @@ class FaceApiClient {
         'images_base64': imageBytesBurst.map(base64Encode).toList(growable: false),
         'device_id': deviceId,
         'mark_attendance': markAttendance,
+        'expected_challenge': expectedChallenge,
+        'challenge_response': challengeResponse,
         'min_verified_samples': minVerifiedSamples,
         'min_consensus_ratio': minConsensusRatio,
         'fast_mode': fastMode,
@@ -568,6 +576,7 @@ class FaceVerificationScanner {
     required this.userId,
     required this.captureFrameBytes,
     this.deviceId = 'flutter-app',
+    this.requireBlinkChallenge = false,
     this.pollInterval = const Duration(milliseconds: 900),
     this.onResult,
     this.onError,
@@ -578,6 +587,7 @@ class FaceVerificationScanner {
   final int userId;
   final CaptureFrameBytes captureFrameBytes;
   final String deviceId;
+  final bool requireBlinkChallenge;
   final Duration pollInterval;
   final VerifyResultCallback? onResult;
   final VerifyErrorCallback? onError;
@@ -609,7 +619,9 @@ class FaceVerificationScanner {
         companyId: companyId,
         userId: userId,
         imageBytes: frame,
+        
         previousImageBytes: _previousFrame,
+        expectedChallenge: requireBlinkChallenge ? 'blink' : null,
         deviceId: deviceId,
       );
       _previousFrame = frame;
@@ -621,6 +633,7 @@ class FaceVerificationScanner {
       }
     } catch (e, st) {
       onError?.call(e, st);
+
     } finally {
       _isRequestRunning = false;
     }

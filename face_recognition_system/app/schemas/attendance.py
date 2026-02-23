@@ -29,6 +29,8 @@ class AttendanceScanRequest(BaseModel):
     previous_image_base64: str | None = None
     device_id: str | None = None
     mark_attendance: bool = True
+    expected_challenge: str | None = None
+    challenge_response: str | None = None
     fast_mode: bool = True
     debug_timing: bool = False
 
@@ -37,6 +39,8 @@ class AttendanceBurstScanRequest(BaseModel):
     images_base64: list[str] = Field(min_length=2, max_length=5)
     device_id: str | None = None
     mark_attendance: bool = True
+    expected_challenge: str | None = None
+    challenge_response: str | None = None
     min_verified_samples: int = Field(default=2, ge=1, le=5)
     min_consensus_ratio: float = Field(default=0.67, ge=0.5, le=1.0)
     fast_mode: bool = True

@@ -259,6 +259,29 @@ class PassiveAntiSpoofDetector:
         return PassiveAntiSpoofDetector.preprocess(face_bgr, out_size=out_size)
 
     @staticmethod
+    def _infer_keras_input_size(model) -> int:
+        try:
+            shape = getattr(model, "input_shape", None)
+            if isinstance(shape, (list, tuple)):
+                dims = list(shape[0]) if shape and isinstance(shape[0], (list, tuple)) else list(shape)
+                if len(dims) >= 3:
+                    h = dims[1]
+                    w = dims[2]
+                    if isinstance(h, int) and isinstance(w, int) and h > 0 and w > 0:
+                        return int(min(h, w))
+        except Exception:
+            pass
+        return 128
+
+    @staticmethod
+    def _preprocess_keras(face_bgr: np.ndarray, out_size: int) -> np.ndarray:
+        h, w = face_bgr.shape[:2]
+        interp = cv2.INTER_AREA if (h >= out_size and w >= out_size) else cv2.INTER_CUBIC
+        resized = cv2.resize(face_bgr, (out_size, out_size), interpolation=interp)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        return np.expand_dims(rgb, axis=0).astype(np.float32)
+
+    @staticmethod
     def _enhance_luma(face_bgr: np.ndarray) -> np.ndarray:
         """
         Mild luminance normalization for difficult lighting without distorting spoof cues.
@@ -396,8 +419,8 @@ class PassiveAntiSpoofDetector:
             )[0]
             base_conf = self._onnx_to_live_confidence(pred)
         else:
-            preprocess_size = 224
-            sample = self.preprocess(face_bgr, out_size=preprocess_size)
+            preprocess_size = self._infer_keras_input_size(model)
+            sample = self._preprocess_keras(face_bgr, out_size=preprocess_size)
             pred = model.predict(sample, verbose=0)
             base_conf = float(np.clip(float(np.asarray(pred).reshape(-1)[0]), 0.0, 1.0))
 
@@ -430,8 +453,8 @@ class PassiveAntiSpoofDetector:
                 tta_batch = np.concatenate(
                     [
                         sample,
-                        self.preprocess(face_flip, out_size=preprocess_size),
-                        self.preprocess(face_luma, out_size=preprocess_size),
+                        self._preprocess_keras(face_flip, out_size=preprocess_size),
+                        self._preprocess_keras(face_luma, out_size=preprocess_size),
                     ],
                     axis=0,
                 )
