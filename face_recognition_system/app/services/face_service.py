@@ -89,6 +89,12 @@ class FaceService:
             return "Lighting too harsh, reduce glare and try again."
         return "Face too small/blurred, move closer and hold still."
 
+    def _embed_face_fast(self, face_bgr: np.ndarray) -> tuple[np.ndarray | None, str | None]:
+        try:
+            return self.engine.embedder.get_embedding_fast(face_bgr), None
+        except ValueError:
+            return None, self._embedding_failure_hint(face_bgr)
+
     def _embed_face_with_retries(
         self,
         image_bgr: np.ndarray,
@@ -402,7 +408,7 @@ class FaceService:
 
         t0 = time.perf_counter()
         image = self.detector.decode_image(image_base64)
-        image = self._resize_for_identify(image, max_side=640)
+        image = self._resize_for_identify(image, max_side=(512 if fast_mode else 640))
         timings["decode_ms"] += (time.perf_counter() - t0) * 1000.0
 
         previous_image = None
@@ -410,7 +416,7 @@ class FaceService:
             try:
                 t0 = time.perf_counter()
                 previous_image = self.detector.decode_image(previous_image_base64)
-                previous_image = self._resize_for_identify(previous_image, max_side=640)
+                previous_image = self._resize_for_identify(previous_image, max_side=(512 if fast_mode else 640))
                 timings["prev_decode_ms"] += (time.perf_counter() - t0) * 1000.0
             except ValueError:
                 previous_image = None
@@ -423,9 +429,17 @@ class FaceService:
 
         if not enforce_liveness:
             model_used = "liveness_disabled"
-            t0 = time.perf_counter()
-            detections = self.detector.detect(image)
-            timings["detect_ms"] += (time.perf_counter() - t0) * 1000.0
+            detections: list[dict] = []
+            if allow_bbox_reuse and previous_bbox and len(previous_bbox) == 4:
+                h, w = image.shape[:2]
+                candidate_bbox = self._clamp_bbox(previous_bbox, w, h)
+                reused_face = self.detector.crop_face(image, candidate_bbox, pad_ratio=0.0)
+                if reused_face.size > 0:
+                    detections = [{"bbox": candidate_bbox, "landmarks": {}, "score": 0.99}]
+            if not detections:
+                t0 = time.perf_counter()
+                detections = self.detector.detect(image)
+                timings["detect_ms"] += (time.perf_counter() - t0) * 1000.0
             if not detections:
                 return _fail("No face detected")
             det = max(
@@ -433,9 +447,12 @@ class FaceService:
                 key=lambda d: (d["bbox"][2] - d["bbox"][0]) * (d["bbox"][3] - d["bbox"][1]),
             )
             face = self.detector.crop_face(image, det["bbox"])
-            candidates = self._recommended_embed_candidates(face, fast_mode=fast_mode)
             t0 = time.perf_counter()
-            query_emb, hint = self._embed_face_with_retries(image, det["bbox"], max_candidates=candidates)
+            if fast_mode:
+                query_emb, hint = self._embed_face_fast(face)
+            else:
+                candidates = self._recommended_embed_candidates(face, fast_mode=fast_mode)
+                query_emb, hint = self._embed_face_with_retries(image, det["bbox"], max_candidates=candidates)
             timings["embed_ms"] += (time.perf_counter() - t0) * 1000.0
             if query_emb is None:
                 return _fail(hint or "Unable to compute embedding", bbox=det["bbox"])
@@ -583,9 +600,12 @@ class FaceService:
                     bbox=det["bbox"],
                 )
 
-            candidates = self._recommended_embed_candidates(face, fast_mode=fast_mode)
             t0 = time.perf_counter()
-            query_emb, hint = self._embed_face_with_retries(image, det["bbox"], max_candidates=candidates)
+            if fast_mode:
+                query_emb, hint = self._embed_face_fast(face)
+            else:
+                candidates = self._recommended_embed_candidates(face, fast_mode=fast_mode)
+                query_emb, hint = self._embed_face_with_retries(image, det["bbox"], max_candidates=candidates)
             timings["embed_ms"] += (time.perf_counter() - t0) * 1000.0
             if query_emb is None:
                 return _fail(hint or "Unable to compute embedding", liveness=liveness_score, bbox=det["bbox"])

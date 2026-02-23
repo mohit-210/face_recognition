@@ -374,7 +374,7 @@ class FaceApiClient {
     Uint8List? previousImageBytes,
     String? deviceId,
     bool markAttendance = true,
-    bool fastMode = false,
+    bool fastMode = true,
     bool debugTiming = false,
   }) async {
     final response = await _sendAuthorized(
@@ -398,7 +398,7 @@ class FaceApiClient {
     bool markAttendance = true,
     int minVerifiedSamples = 2,
     double minConsensusRatio = 0.67,
-    bool fastMode = false,
+    bool fastMode = true,
     bool debugTiming = false,
   }) async {
     if (imageBytesBurst.length < 2) {

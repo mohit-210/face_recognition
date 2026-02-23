@@ -76,6 +76,8 @@ class FaceLockManager:
 
 
 _lock_managers: dict[int, FaceLockManager] = {}
+_identify_bbox_cache: dict[int, dict] = {}
+_IDENTIFY_BBOX_TTL_SECONDS = 2.0
 _attendance_bbox_cache: dict[int, dict] = {}
 _ATTENDANCE_BBOX_TTL_SECONDS = 3.0
 _attendance_confirm_cache: dict[int, dict] = {}
@@ -105,11 +107,32 @@ def _get_recent_attendance_bbox(user_id: int) -> list[int] | None:
     return None
 
 
+def _get_recent_identify_bbox(user_id: int) -> list[int] | None:
+    payload = _identify_bbox_cache.get(user_id)
+    if not payload:
+        return None
+    ts = float(payload.get("ts", 0.0))
+    if (time.monotonic() - ts) > _IDENTIFY_BBOX_TTL_SECONDS:
+        _identify_bbox_cache.pop(user_id, None)
+        return None
+    bbox = payload.get("bbox")
+    if isinstance(bbox, list) and len(bbox) == 4:
+        return [int(v) for v in bbox]
+    return None
+
+
 def _set_recent_attendance_bbox(user_id: int, bbox: list[int] | None) -> None:
     if not bbox or len(bbox) != 4:
         _attendance_bbox_cache.pop(user_id, None)
         return
     _attendance_bbox_cache[user_id] = {"ts": time.monotonic(), "bbox": [int(v) for v in bbox]}
+
+
+def _set_recent_identify_bbox(user_id: int, bbox: list[int] | None) -> None:
+    if not bbox or len(bbox) != 4:
+        _identify_bbox_cache.pop(user_id, None)
+        return
+    _identify_bbox_cache[user_id] = {"ts": time.monotonic(), "bbox": [int(v) for v in bbox]}
 
 
 def _consume_attendance_confirm(admin_user_id: int, target_user_id: int) -> tuple[bool, int]:
@@ -851,12 +874,18 @@ def identify_face(
 ):
     current = _require_admin(request, db)
     image_b64 = _image_to_base64(image)
-    return FaceService(db).identify_in_company(
+    previous_bbox = _get_recent_identify_bbox(current.id)
+    result = FaceService(db).identify_in_company(
         company_id=current.company_id,
         image_base64=image_b64,
         device_id=device_id.strip() or None,
         enforce_liveness=not bool(fast_mode),
+        previous_bbox=previous_bbox,
+        fast_mode=bool(fast_mode),
+        allow_bbox_reuse=True,
     )
+    _set_recent_identify_bbox(current.id, result.get("_bbox"))
+    return result
 
 
 @router.post("/face/frame-guide")

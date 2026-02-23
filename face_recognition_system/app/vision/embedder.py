@@ -33,6 +33,26 @@ class FaceEmbedder:
 
         raise ValueError("Unable to compute embedding from provided face crop")
 
+    def get_embedding_fast(self, face_bgr: np.ndarray) -> np.ndarray:
+        """
+        Single-pass embedding for low-latency paths.
+        Skips padded/upscaled retries to reduce CPU load.
+        """
+        if face_bgr.size == 0:
+            raise ValueError("Empty face crop")
+
+        rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
+        faces = self.model.get(rgb)
+        if not faces:
+            raise ValueError("Unable to compute embedding from provided face crop")
+
+        best_face = max(faces, key=lambda f: float(getattr(f, "det_score", 0.0)))
+        emb = best_face.embedding.astype(np.float32)
+        norm = np.linalg.norm(emb)
+        if norm == 0:
+            raise ValueError("Invalid embedding")
+        return emb / norm
+
     def get_best_embedding(self, image_bgr: np.ndarray) -> tuple[np.ndarray, int]:
         """
         Returns normalized embedding for the highest-confidence face and number of faces found.
