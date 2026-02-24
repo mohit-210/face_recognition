@@ -1,4 +1,4 @@
-﻿from functools import lru_cache
+from functools import lru_cache
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -30,11 +30,11 @@ class Settings(BaseSettings):
     attendance_min_motion_diff: float = Field(default=1.6, ge=0.1, le=20.0)
     attendance_auto_checkout_after_minutes: int = Field(default=480, ge=1, le=1440)
     passive_antispoof_model_path: str = "./models/passive_antispoof_mini_fasnet.keras"
-    passive_antispoof_onnx_path: str = "./models/vit_antispoof.onnx"
-    passive_antispoof_backend: str = "auto"
+    passive_antispoof_onnx_path: str = "./models/passive_antispoof.onnx"
+    passive_antispoof_backend: str = "onnx"
     passive_antispoof_onnx_input_size: int = Field(default=224, ge=64, le=256)
     passive_antispoof_onnx_live_index: int = Field(default=1, ge=0, le=4)
-    passive_antispoof_calibration_path: str = "./models/vit_antispoof_calibration.json"
+    passive_antispoof_calibration_path: str = "./models/passive_antispoof_calibration.json"
     passive_quality_gate_enabled: bool = Field(default=False)
     passive_calibration_max_eer: float = Field(default=0.75, ge=0.0, le=1.0)
     passive_calibration_min_auc: float = Field(default=0.45, ge=0.0, le=1.0)

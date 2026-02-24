@@ -528,20 +528,9 @@ class FaceService:
                 # Keep fallback calibration conservative; avoid inflating live confidence.
                 liveness_score = min(1.0, liveness_score + 0.02)
             else:
-                heuristic_liveness = float(
-                    self.engine.liveness.score(
-                        face,
-                        det.get("landmarks", {}),
-                        expected_challenge=expected_challenge,
-                        challenge_response=challenge_response,
-                        previous_face_bgr=previous_face,
-                    )
-                )
-                if mobile_mode:
-                    # Favor CNN output on mobile captures where heuristic can be noisy.
-                    liveness_score = float((0.88 * float(passive.confidence)) + (0.12 * heuristic_liveness))
-                else:
-                    liveness_score = float((0.80 * float(passive.confidence)) + (0.20 * heuristic_liveness))
+                # Keep liveness score directly from passive anti-spoof model.
+                # Blink challenge is enforced separately and must not alter this score.
+                liveness_score = float(passive.confidence)
 
             motion_score = float(self.engine.liveness._motion_score(face, previous_face))
             expected_challenge_norm = (expected_challenge or "").strip().lower()
@@ -576,8 +565,6 @@ class FaceService:
                 blink_pass_threshold = 0.65 if mobile_mode else 0.80
                 if blink_score >= blink_pass_threshold:
                     blink_passed = True
-                    # Report a meaningful live score when explicit blink is observed.
-                    liveness_score = max(float(liveness_score), float(blink_score))
                     model_used = f"{model_used} + blink_challenge"
                 else:
                     return _fail(
