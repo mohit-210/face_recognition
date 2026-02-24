@@ -81,7 +81,7 @@ class PassiveAntiSpoofDetector:
     """
     Passive liveness detector:
     1) environmental pre-check (blur + lighting)
-    2) ViT ONNX inference (224x224 + ImageNet norm)
+    2) ONNX inference with configurable preprocess
     """
 
     def __init__(self) -> None:
@@ -91,6 +91,7 @@ class PassiveAntiSpoofDetector:
         self.onnx_input_name: str | None = None
         self.onnx_output_name: str | None = None
         self.onnx_input_size: int | None = None
+        self.onnx_input_layout: str = "nchw"
         self.model_ready = False
         self.calibration_ok = False
         self.calibration: dict = {}
@@ -126,6 +127,7 @@ class PassiveAntiSpoofDetector:
                     self.onnx_input_name = inps[0].name
                     self.onnx_output_name = outs[0].name
                     self.onnx_input_size = self._infer_onnx_input_size(inps[0].shape)
+                    self.onnx_input_layout = self._infer_onnx_input_layout(inps[0].shape)
                     self.model_ready = True
                     active_eps = ", ".join(session.get_providers())
                     self.model_descriptor = (
@@ -136,6 +138,7 @@ class PassiveAntiSpoofDetector:
                     self.onnx_input_name = None
                     self.onnx_output_name = None
                     self.onnx_input_size = None
+                    self.onnx_input_layout = "nchw"
                     self.model_ready = False
                     logger.exception("Failed to load passive anti-spoof ONNX model from %s", self.onnx_path)
 
@@ -249,17 +252,84 @@ class PassiveAntiSpoofDetector:
         return None
 
     @staticmethod
-    def preprocess(face_bgr: np.ndarray, out_size: int = 224) -> np.ndarray:
-        # ViT PAD: RGB + ImageNet normalization.
+    def preprocess(face_bgr: np.ndarray, out_size: int, mode: str = "minifasnet", layout: str = "nchw") -> np.ndarray:
+        # ONNX preprocess:
+        # - minifasnet: RGB, (x-127.5)/128, NCHW
+        # - imagenet: RGB/255 then ImageNet mean/std, NCHW
+        mode_norm = (mode or "minifasnet").strip().lower()
+        h, w = face_bgr.shape[:2]
+        interp = cv2.INTER_AREA if (h >= out_size and w >= out_size) else cv2.INTER_CUBIC
+        resized = cv2.resize(face_bgr, (out_size, out_size), interpolation=interp)
+        if mode_norm == "keras_legacy":
+            gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+            lap = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
+            lap = np.clip(np.abs(lap), 0.0, 1.0)
+            fft = np.fft.fft2(gray)
+            fft_shift = np.fft.fftshift(fft)
+            magnitude = np.log1p(np.abs(fft_shift))
+            magnitude = magnitude / (float(np.max(magnitude)) + 1e-6)
+            hwc = np.stack([gray, lap, magnitude.astype(np.float32)], axis=-1).astype(np.float32)
+        else:
+            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32)
+            if mode_norm == "imagenet":
+                rgb = rgb / 255.0
+                mean = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
+                std = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
+                hwc = (rgb - mean) / std
+            else:
+                hwc = (rgb - 127.5) / 128.0
+
+        if (layout or "nchw").strip().lower() == "nhwc":
+            return np.expand_dims(hwc, axis=0).astype(np.float32)
+        chw = np.transpose(hwc, (2, 0, 1))
+        return np.expand_dims(chw, axis=0).astype(np.float32)
+
+    @staticmethod
+    def _infer_onnx_input_layout(shape) -> str:
+        if isinstance(shape, (list, tuple)) and len(shape) == 4:
+            c_last = shape[-1]
+            c_mid = shape[1]
+            if isinstance(c_last, int) and c_last == 3:
+                return "nhwc"
+            if isinstance(c_mid, int) and c_mid == 3:
+                return "nchw"
+        return "nchw"
+
+    @staticmethod
+    def _preprocess_keras_legacy(face_bgr: np.ndarray, out_size: int) -> np.ndarray:
+        h, w = face_bgr.shape[:2]
+        interp = cv2.INTER_AREA if (h >= out_size and w >= out_size) else cv2.INTER_CUBIC
+        resized = cv2.resize(face_bgr, (out_size, out_size), interpolation=interp)
+        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        lap = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
+        lap = np.clip(np.abs(lap), 0.0, 1.0)
+        fft = np.fft.fft2(gray)
+        fft_shift = np.fft.fftshift(fft)
+        magnitude = np.log1p(np.abs(fft_shift))
+        magnitude = magnitude / (float(np.max(magnitude)) + 1e-6)
+        stacked = np.stack([gray, lap, magnitude.astype(np.float32)], axis=-1).astype(np.float32)
+        return np.expand_dims(stacked, axis=0).astype(np.float32)
+
+    @staticmethod
+    def _preprocess_keras_rgb(face_bgr: np.ndarray, out_size: int) -> np.ndarray:
         h, w = face_bgr.shape[:2]
         interp = cv2.INTER_AREA if (h >= out_size and w >= out_size) else cv2.INTER_CUBIC
         resized = cv2.resize(face_bgr, (out_size, out_size), interpolation=interp)
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        mean = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
-        norm = (rgb - mean) / std
-        chw = np.transpose(norm, (2, 0, 1))
-        return np.expand_dims(chw, axis=0).astype(np.float32)
+        return np.expand_dims(rgb, axis=0).astype(np.float32)
+
+    @staticmethod
+    def _looks_like_legacy_feature_model(model) -> bool:
+        model_name = str(getattr(model, "name", "") or "").lower()
+        if "mini_fasnet" in model_name:
+            return True
+        return False
+
+    @staticmethod
+    def _preprocess_keras(face_bgr: np.ndarray, out_size: int, model=None) -> np.ndarray:
+        if model is not None and PassiveAntiSpoofDetector._looks_like_legacy_feature_model(model):
+            return PassiveAntiSpoofDetector._preprocess_keras_legacy(face_bgr, out_size=out_size)
+        return PassiveAntiSpoofDetector._preprocess_keras_rgb(face_bgr, out_size=out_size)
 
     @staticmethod
     def _scaled_bbox(bbox: list[int], scale: float, img_w: int, img_h: int) -> list[int]:
@@ -286,9 +356,14 @@ class PassiveAntiSpoofDetector:
         crop = image_bgr[y1:y2, x1:x2]
         return crop
 
-    @staticmethod
-    def _preprocess_celeba(face_bgr: np.ndarray, out_size: int) -> np.ndarray:
-        return PassiveAntiSpoofDetector.preprocess(face_bgr, out_size=out_size)
+    def _preprocess_celeba(self, face_bgr: np.ndarray, out_size: int) -> np.ndarray:
+        mode = str(getattr(self.settings, "passive_antispoof_onnx_preprocess", "minifasnet") or "minifasnet")
+        return PassiveAntiSpoofDetector.preprocess(
+            face_bgr,
+            out_size=out_size,
+            mode=mode,
+            layout=getattr(self, "onnx_input_layout", "nchw"),
+        )
 
     @staticmethod
     def _infer_keras_input_size(model) -> int:
@@ -304,14 +379,6 @@ class PassiveAntiSpoofDetector:
         except Exception:
             pass
         return 128
-
-    @staticmethod
-    def _preprocess_keras(face_bgr: np.ndarray, out_size: int) -> np.ndarray:
-        h, w = face_bgr.shape[:2]
-        interp = cv2.INTER_AREA if (h >= out_size and w >= out_size) else cv2.INTER_CUBIC
-        resized = cv2.resize(face_bgr, (out_size, out_size), interpolation=interp)
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        return np.expand_dims(rgb, axis=0).astype(np.float32)
 
     @staticmethod
     def _enhance_luma(face_bgr: np.ndarray) -> np.ndarray:
@@ -374,7 +441,7 @@ class PassiveAntiSpoofDetector:
             return 0.0
 
         # Scalar/binary output (single logit).
-        if arr.ndim == 0 or (arr.ndim == 1 and arr.shape[0] == 1):
+        if arr.size == 1:
             val = float(arr.reshape(-1)[0])
             if 0.0 <= val <= 1.0:
                 return float(val)
@@ -385,6 +452,11 @@ class PassiveAntiSpoofDetector:
         else:
             vec = arr.reshape(arr.shape[0], -1)[0]
 
+        live_idx = int(self.settings.passive_antispoof_onnx_live_index)
+        if live_idx < 0 or live_idx >= vec.shape[0]:
+            live_idx = min(1, vec.shape[0] - 1)
+        spoof_idx = 1 - live_idx if vec.shape[0] == 2 else None
+
         # If model already outputs probabilities, use directly.
         if np.all(vec >= 0.0) and np.all(vec <= 1.0):
             s = float(np.sum(vec))
@@ -392,16 +464,28 @@ class PassiveAntiSpoofDetector:
                 probs = vec
             else:
                 probs = vec / max(1e-6, s)
+            if probs.shape[0] == 2 and spoof_idx is not None:
+                # Convert probability margin to a softer confidence to avoid hard 0/1 outputs.
+                temp = float(getattr(self.settings, "passive_antispoof_onnx_temperature", 2.5) or 2.5)
+                temp = max(0.5, min(8.0, temp))
+                margin = float(probs[live_idx] - probs[spoof_idx])
+                conf = 1.0 / (1.0 + np.exp(-(margin * temp)))
+                return float(np.clip(conf, 0.01, 0.99))
+            return float(np.clip(float(probs[live_idx]), 0.01, 0.99))
         else:
             # Treat as logits.
+            if vec.shape[0] == 2 and spoof_idx is not None:
+                # For 2-class logits, use logit margin with temperature for stability.
+                temp = float(getattr(self.settings, "passive_antispoof_onnx_temperature", 2.5) or 2.5)
+                temp = max(0.5, min(8.0, temp))
+                margin = float(vec[live_idx] - vec[spoof_idx])
+                conf = 1.0 / (1.0 + np.exp(-(margin / temp)))
+                return float(np.clip(conf, 0.01, 0.99))
+
             shifted = vec - float(np.max(vec))
             exps = np.exp(shifted)
             probs = exps / max(1e-6, float(np.sum(exps)))
-
-        live_idx = int(self.settings.passive_antispoof_onnx_live_index)
-        if live_idx < 0 or live_idx >= probs.shape[0]:
-            live_idx = min(1, probs.shape[0] - 1)
-        return float(np.clip(float(probs[live_idx]), 0.0, 1.0))
+            return float(np.clip(float(probs[live_idx]), 0.01, 0.99))
 
     def score_from_image(
         self,
@@ -450,9 +534,21 @@ class PassiveAntiSpoofDetector:
                 {self.onnx_input_name: onnx_input},
             )[0]
             base_conf = self._onnx_to_live_confidence(pred)
+            if bool(getattr(self.settings, "passive_antispoof_debug_scores", False)):
+                try:
+                    raw = np.asarray(pred).reshape(-1).tolist()
+                    logger.info(
+                        "Passive ONNX debug: preprocess=%s input_size=%s raw=%s base_conf=%.6f",
+                        str(getattr(self.settings, "passive_antispoof_onnx_preprocess", "minifasnet")),
+                        preprocess_size,
+                        raw,
+                        base_conf,
+                    )
+                except Exception:
+                    logger.exception("Passive ONNX debug logging failed")
         else:
             preprocess_size = self._infer_keras_input_size(model)
-            sample = self._preprocess_keras(face_bgr, out_size=preprocess_size)
+            sample = self._preprocess_keras(face_bgr, out_size=preprocess_size, model=model)
             pred = model.predict(sample, verbose=0)
             base_conf = float(np.clip(float(np.asarray(pred).reshape(-1)[0]), 0.0, 1.0))
 
@@ -500,20 +596,31 @@ class PassiveAntiSpoofDetector:
                 tta_batch = np.concatenate(
                     [
                         sample,
-                        self._preprocess_keras(face_flip, out_size=preprocess_size),
-                        self._preprocess_keras(face_luma, out_size=preprocess_size),
+                        self._preprocess_keras(face_flip, out_size=preprocess_size, model=model),
+                        self._preprocess_keras(face_luma, out_size=preprocess_size, model=model),
                     ],
                     axis=0,
                 )
                 tta_pred = model.predict(tta_batch, verbose=0).reshape(-1)
                 confidence = float(np.clip(float(np.mean(tta_pred)), 0.0, 1.0))
 
-        confidence = self._apply_threshold_calibration(confidence)
-        # Keep output dynamic; avoid frequent hard saturation at 1.0 in UI/decision logs.
-        confidence = (0.65 * float(confidence)) + (0.35 * float(base_conf))
+        raw_confidence = float(confidence)
+        calibrated = self._apply_threshold_calibration(raw_confidence)
+        # Keep score close to raw model output; apply only a light calibration blend
+        # to avoid collapsing values near 1.0 for both genuine and replay samples.
+        confidence = raw_confidence + (0.25 * (calibrated - raw_confidence))
 
         calibrated_bias = float(self.calibration.get("score_bias", 0.0))
-        confidence = float(np.clip(confidence + calibrated_bias - soft_penalty, 0.0, 0.99))
+        confidence = float(np.clip(confidence + calibrated_bias - soft_penalty, 0.0, 1.0))
+        if bool(getattr(self.settings, "passive_antispoof_debug_scores", False)):
+            logger.info(
+                "Passive score debug: base=%.6f calibrated=%.6f bias=%.6f penalty=%.6f final=%.6f",
+                base_conf,
+                calibrated,
+                calibrated_bias,
+                soft_penalty,
+                confidence,
+            )
 
         return PassiveLivenessResult(confidence=confidence, reason="passive_inference")
 

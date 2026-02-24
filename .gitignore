@@ -49,6 +49,11 @@ face_recognition_system/server.win*.out
 face_recognition_system/server.win*.err
 face_recognition_system/run8001.out.log
 face_recognition_system/run8001.err.log
+face_recognition_system/face_recognition_dataset/
+face_recognition_system/models/passive_antispoof_from_keras.onnx
+face_recognition_system/models/passive_antispoof_calibration_from_keras_onnx.json
+face_recognition_system/models/passive_antispoof_calibration_onnx_*.json
+face_recognition_system/models/passive_antispoof_eval_report*.json
 
 # Flutter / Dart generated files (if Flutter app is added here)
 .dart_tool/
