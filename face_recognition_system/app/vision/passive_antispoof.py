@@ -116,7 +116,8 @@ class PassiveAntiSpoofDetector:
                 logger.warning("ONNX backend requested but onnxruntime is unavailable.")
             else:
                 try:
-                    session = ort.InferenceSession(str(self.onnx_path), providers=["CPUExecutionProvider"])
+                    providers = self._resolve_onnx_providers()
+                    session = ort.InferenceSession(str(self.onnx_path), providers=providers)
                     inps = session.get_inputs()
                     outs = session.get_outputs()
                     if not inps or not outs:
@@ -126,7 +127,10 @@ class PassiveAntiSpoofDetector:
                     self.onnx_output_name = outs[0].name
                     self.onnx_input_size = self._infer_onnx_input_size(inps[0].shape)
                     self.model_ready = True
-                    self.model_descriptor = f"vit_antispoof_onnx ({self.onnx_path.name}) via onnxruntime"
+                    active_eps = ", ".join(session.get_providers())
+                    self.model_descriptor = (
+                        f"vit_antispoof_onnx ({self.onnx_path.name}) via onnxruntime [{active_eps}]"
+                    )
                 except Exception:
                     self.onnx_session = None
                     self.onnx_input_name = None
@@ -201,6 +205,34 @@ class PassiveAntiSpoofDetector:
                 )
         else:
             self.calibration_ok = False
+
+    def _resolve_onnx_providers(self) -> list[str]:
+        if ort is None:
+            return ["CPUExecutionProvider"]
+        configured = [
+            p.strip() for p in str(self.settings.passive_antispoof_onnx_providers or "").split(",") if p.strip()
+        ]
+        if not configured:
+            configured = ["CPUExecutionProvider"]
+
+        try:
+            available = set(ort.get_available_providers())
+        except Exception:
+            available = {"CPUExecutionProvider"}
+
+        selected = [p for p in configured if p in available]
+        if "CPUExecutionProvider" in available and "CPUExecutionProvider" not in selected:
+            selected.append("CPUExecutionProvider")
+        if not selected:
+            selected = ["CPUExecutionProvider"]
+
+        logger.info(
+            "Passive anti-spoof ONNX providers configured=%s available=%s selected=%s",
+            configured,
+            sorted(list(available)),
+            selected,
+        )
+        return selected
 
     @staticmethod
     def _infer_onnx_input_size(shape) -> int | None:
@@ -440,12 +472,27 @@ class PassiveAntiSpoofDetector:
                     self._preprocess_celeba(face_luma, out_size=preprocess_size),
                 ]
                 preds = []
-                for inp in tta_inputs:
-                    pred = onnx_session.run(
+                # Run TTA in a single batch when possible to reduce host overhead.
+                try:
+                    tta_batch = np.concatenate(tta_inputs, axis=0)
+                    batch_pred = onnx_session.run(
                         [self.onnx_output_name],
-                        {self.onnx_input_name: inp},
+                        {self.onnx_input_name: tta_batch},
                     )[0]
-                    preds.append(self._onnx_to_live_confidence(pred))
+                    batch_arr = np.asarray(batch_pred)
+                    if batch_arr.ndim >= 1 and int(batch_arr.shape[0]) == int(tta_batch.shape[0]):
+                        preds = [self._onnx_to_live_confidence(batch_arr[i]) for i in range(batch_arr.shape[0])]
+                except Exception:
+                    preds = []
+
+                if not preds:
+                    for inp in tta_inputs:
+                        pred = onnx_session.run(
+                            [self.onnx_output_name],
+                            {self.onnx_input_name: inp},
+                        )[0]
+                        preds.append(self._onnx_to_live_confidence(pred))
+
                 confidence = float(np.clip(float(np.mean(preds)), 0.0, 1.0))
             else:
                 face_flip = cv2.flip(face_bgr, 1)
@@ -462,9 +509,11 @@ class PassiveAntiSpoofDetector:
                 confidence = float(np.clip(float(np.mean(tta_pred)), 0.0, 1.0))
 
         confidence = self._apply_threshold_calibration(confidence)
+        # Keep output dynamic; avoid frequent hard saturation at 1.0 in UI/decision logs.
+        confidence = (0.65 * float(confidence)) + (0.35 * float(base_conf))
 
         calibrated_bias = float(self.calibration.get("score_bias", 0.0))
-        confidence = float(np.clip(confidence + calibrated_bias - soft_penalty, 0.0, 1.0))
+        confidence = float(np.clip(confidence + calibrated_bias - soft_penalty, 0.0, 0.99))
 
         return PassiveLivenessResult(confidence=confidence, reason="passive_inference")
 

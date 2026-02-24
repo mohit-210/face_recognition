@@ -54,15 +54,20 @@ class LivenessDetector:
     def _eye_open_score(face_bgr: np.ndarray) -> float:
         if face_bgr.size == 0:
             return 0.0
+        if _EYE_CASCADE.empty():
+            return 0.0
         gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
         h = gray.shape[0]
         roi = cv2.equalizeHist(gray[: max(1, int(h * 0.62)), :])
-        eyes = _EYE_CASCADE.detectMultiScale(
-            roi,
-            scaleFactor=1.1,
-            minNeighbors=4,
-            minSize=(12, 12),
-        )
+        try:
+            eyes = _EYE_CASCADE.detectMultiScale(
+                roi,
+                scaleFactor=1.1,
+                minNeighbors=4,
+                minSize=(12, 12),
+            )
+        except cv2.error:
+            return 0.0
         eye_count = min(2, len(eyes)) if eyes is not None else 0
         return float(eye_count) / 2.0
 

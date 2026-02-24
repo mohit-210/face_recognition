@@ -18,6 +18,7 @@ htmlcov/
 
 # Virtual environments
 .venv/
+.venv*/
 venv/
 env/
 
@@ -39,9 +40,15 @@ pip-wheel-metadata/
 
 # Project-specific local artifacts
 face_recognition_system/.venv/
+face_recognition_system/.venv*/
+face_recognition_system/.venv311/
 face_recognition_system/data/
 face_recognition_system/server.out
 face_recognition_system/server.err
+face_recognition_system/server.win*.out
+face_recognition_system/server.win*.err
+face_recognition_system/run8001.out.log
+face_recognition_system/run8001.err.log
 
 # Flutter / Dart generated files (if Flutter app is added here)
 .dart_tool/

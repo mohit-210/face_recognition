@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     passive_antispoof_model_path: str = "./models/passive_antispoof_mini_fasnet.keras"
     passive_antispoof_onnx_path: str = "./models/passive_antispoof.onnx"
     passive_antispoof_backend: str = "onnx"
+    passive_antispoof_onnx_providers: str = "OpenVINOExecutionProvider,CPUExecutionProvider"
     passive_antispoof_onnx_input_size: int = Field(default=224, ge=64, le=256)
     passive_antispoof_onnx_live_index: int = Field(default=1, ge=0, le=4)
     passive_antispoof_calibration_path: str = "./models/passive_antispoof_calibration.json"
@@ -41,8 +42,10 @@ class Settings(BaseSettings):
     passive_blur_min_variance: float = Field(default=32.0, ge=1.0, le=5000.0)
     passive_lighting_min: float = Field(default=55.0, ge=0.0, le=255.0)
     passive_lighting_max: float = Field(default=205.0, ge=0.0, le=255.0)
-    arcface_model_name: str = "buffalo_l"
-    arcface_det_size: int = Field(default=640, ge=320, le=1280)
+    arcface_model_name: str = "buffalo_s"
+    arcface_onnx_providers: str = "CPUExecutionProvider"
+    arcface_ctx_id: int = Field(default=-1, ge=-1, le=8)
+    arcface_det_size: int = Field(default=320, ge=320, le=1280)
     retinaface_min_score: float = Field(default=0.70, ge=0.0, le=1.0)
 
     model_path: str = "./models"

@@ -9,8 +9,9 @@ from app.vision.liveness import LivenessDetector
 class RecognitionEngine:
     def __init__(self) -> None:
         self.settings = get_settings()
-        self.detector = FaceDetector()
         self.embedder = FaceEmbedder()
+        shared_det_model = getattr(self.embedder.model, "det_model", None)
+        self.detector = FaceDetector(onnx_det_model=shared_det_model)
         self.liveness = LivenessDetector()
 
     @staticmethod

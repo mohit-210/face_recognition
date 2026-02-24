@@ -261,10 +261,10 @@ class FaceApiClient {
         'password': password,
       }),
     );
-    final map = _decodeMap(response);
     if (response.statusCode >= 400) {
-      throw FaceApiException(_extractDetail(map), statusCode: response.statusCode);
+      throw FaceApiException(_extractErrorMessage(response), statusCode: response.statusCode);
     }
+    final map = _decodeMap(response);
     final tokens = AuthTokens.fromJson(map);
     _tokens = tokens;
     return tokens;
@@ -280,10 +280,10 @@ class FaceApiClient {
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode({'refresh_token': current.refreshToken}),
     );
-    final map = _decodeMap(response);
     if (response.statusCode >= 400) {
-      throw FaceApiException(_extractDetail(map), statusCode: response.statusCode);
+      throw FaceApiException(_extractErrorMessage(response), statusCode: response.statusCode);
     }
+    final map = _decodeMap(response);
     final refreshed = AuthTokens.fromJson(map);
     _tokens = refreshed;
     return refreshed;
@@ -379,6 +379,28 @@ class FaceApiClient {
     bool fastMode = true,
     bool debugTiming = false,
   }) async {
+    try {
+      final multipartResponse = await _sendAuthorizedMultipart(
+        path: '/api/v1/attendance/scan-face-upload',
+        fields: {
+          if (deviceId != null) 'device_id': deviceId,
+          'mark_attendance': markAttendance.toString(),
+          if (expectedChallenge != null) 'expected_challenge': expectedChallenge,
+          if (challengeResponse != null) 'challenge_response': challengeResponse,
+          'fast_mode': fastMode.toString(),
+          'debug_timing': debugTiming.toString(),
+        },
+        files: [
+          _MultipartFileSpec(field: 'image', bytes: imageBytes, filename: 'frame.jpg'),
+          if (previousImageBytes != null)
+            _MultipartFileSpec(field: 'previous_image', bytes: previousImageBytes, filename: 'previous.jpg'),
+        ],
+      );
+      return AttendanceScanResponse.fromJson(_decodeMap(multipartResponse));
+    } on FaceApiException catch (e) {
+      if (e.statusCode != 404 && e.statusCode != 405) rethrow;
+    }
+
     final response = await _sendAuthorized(
       method: 'POST',
       path: '/api/v1/attendance/scan-face',
@@ -413,6 +435,30 @@ class FaceApiClient {
     if (imageBytesBurst.length > 5) {
       throw FaceApiException('A maximum of 5 frames is allowed for burst attendance scan.');
     }
+    try {
+      final files = <_MultipartFileSpec>[];
+      for (var i = 0; i < imageBytesBurst.length; i++) {
+        files.add(_MultipartFileSpec(field: 'images', bytes: imageBytesBurst[i], filename: 'frame_$i.jpg'));
+      }
+      final multipartResponse = await _sendAuthorizedMultipart(
+        path: '/api/v1/attendance/scan-face-burst-upload',
+        fields: {
+          if (deviceId != null) 'device_id': deviceId,
+          'mark_attendance': markAttendance.toString(),
+          if (expectedChallenge != null) 'expected_challenge': expectedChallenge,
+          if (challengeResponse != null) 'challenge_response': challengeResponse,
+          'min_verified_samples': minVerifiedSamples.toString(),
+          'min_consensus_ratio': minConsensusRatio.toString(),
+          'fast_mode': fastMode.toString(),
+          'debug_timing': debugTiming.toString(),
+        },
+        files: files,
+      );
+      return AttendanceScanResponse.fromJson(_decodeMap(multipartResponse));
+    } on FaceApiException catch (e) {
+      if (e.statusCode != 404 && e.statusCode != 405) rethrow;
+    }
+
     final response = await _sendAuthorized(
       method: 'POST',
       path: '/api/v1/attendance/scan-face-burst',
@@ -447,6 +493,9 @@ class FaceApiClient {
       method: 'GET',
       uri: uri,
     );
+    if (response.statusCode >= 400) {
+      throw FaceApiException(_extractErrorMessage(response), statusCode: response.statusCode);
+    }
     final decoded = jsonDecode(response.body);
     if (decoded is! List) {
       throw FaceApiException('Unexpected attendance response format.');
@@ -504,8 +553,7 @@ class FaceApiClient {
     }
 
     if (response.statusCode >= 400) {
-      final map = _decodeMap(response);
-      throw FaceApiException(_extractDetail(map), statusCode: response.statusCode);
+      throw FaceApiException(_extractErrorMessage(response), statusCode: response.statusCode);
     }
     return response;
   }
@@ -541,12 +589,84 @@ class FaceApiClient {
   }
 
   Map<String, dynamic> _decodeMap(http.Response response) {
-    if (response.body.trim().isEmpty) return <String, dynamic>{};
-    final decoded = jsonDecode(response.body);
+    final body = response.body.trim();
+    if (body.isEmpty) return <String, dynamic>{};
+    final decoded = jsonDecode(body);
     if (decoded is Map<String, dynamic>) {
       return decoded;
     }
     throw FaceApiException('Unexpected API response format.', statusCode: response.statusCode);
+  }
+
+  Future<http.Response> _sendAuthorizedMultipart({
+    required String path,
+    required Map<String, String> fields,
+    required List<_MultipartFileSpec> files,
+    bool retryAfterRefresh = true,
+  }) async {
+    final token = _tokens?.accessToken;
+    if (token == null) {
+      throw FaceApiException('Not logged in');
+    }
+
+    final uri = Uri.parse('$baseUrl$path');
+    final request = http.MultipartRequest('POST', uri)
+      ..headers['Authorization'] = 'Bearer $token'
+      ..fields.addAll(fields);
+
+    for (final file in files) {
+      request.files.add(
+        http.MultipartFile.fromBytes(
+          file.field,
+          file.bytes,
+          filename: file.filename,
+        ),
+      );
+    }
+
+    final streamed = await _httpClient.send(request);
+    final response = await http.Response.fromStream(streamed);
+
+    if (response.statusCode == 401 && retryAfterRefresh && _tokens != null) {
+      await refreshToken();
+      return _sendAuthorizedMultipart(
+        path: path,
+        fields: fields,
+        files: files,
+        retryAfterRefresh: false,
+      );
+    }
+
+    if (response.statusCode >= 400) {
+      throw FaceApiException(_extractErrorMessage(response), statusCode: response.statusCode);
+    }
+    return response;
+  }
+
+  Map<String, dynamic>? _tryDecodeMap(String rawBody) {
+    final body = rawBody.trim();
+    if (body.isEmpty) return null;
+    try {
+      final decoded = jsonDecode(body);
+      if (decoded is Map<String, dynamic>) {
+        return decoded;
+      }
+    } catch (_) {
+      // Non-JSON error bodies (for example, plain text 500 responses) are valid here.
+    }
+    return null;
+  }
+
+  String _extractErrorMessage(http.Response response) {
+    final map = _tryDecodeMap(response.body);
+    if (map != null) {
+      return _extractDetail(map);
+    }
+    final raw = response.body.trim();
+    if (raw.isNotEmpty) {
+      return raw;
+    }
+    return 'Request failed';
   }
 
   String _extractDetail(Map<String, dynamic> body) {
@@ -563,6 +683,18 @@ class FaceApiClient {
   void dispose() {
     _httpClient.close();
   }
+}
+
+class _MultipartFileSpec {
+  _MultipartFileSpec({
+    required this.field,
+    required this.bytes,
+    required this.filename,
+  });
+
+  final String field;
+  final Uint8List bytes;
+  final String filename;
 }
 
 typedef CaptureFrameBytes = Future<Uint8List?> Function();

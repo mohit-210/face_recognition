@@ -1,5 +1,6 @@
 ﻿from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
+import cv2
 
 from app.api.routes import auth, company, users, face, logs, attendance
 from app.core.config import get_settings
@@ -22,8 +23,15 @@ app.mount("/admin/static", StaticFiles(directory=str(ADMIN_BASE_DIR / "static"))
 
 @app.on_event("startup")
 def warm_vision_models() -> None:
+    # Reduce CPU burst from OpenCV internal thread oversubscription on Windows.
+    try:
+        cv2.setNumThreads(2)
+        cv2.ocl.setUseOpenCL(False)
+    except Exception:
+        pass
     # Preload deep models once at boot to avoid first-request latency spikes.
-    get_recognition_engine()
+    recognition = get_recognition_engine()
+    recognition.embedder.preflight_runtime()
     get_passive_antispoof_detector()
 
 

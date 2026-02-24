@@ -65,6 +65,29 @@ uvicorn app.main:app --reload --port 8000
 ```
 5. Open docs: `http://localhost:8000/docs`
 
+### Windows Intel GPU (DirectML) Run
+Use this if you want Intel Iris Xe acceleration for ONNX liveness on Windows (outside Docker).
+
+1. Create and activate venv (once):
+```powershell
+cd face_recognition_system
+py -3.11 -m venv .venv
+```
+
+2. Install DirectML runtime in venv:
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup_windows_directml.ps1
+```
+
+3. Run API with DirectML provider priority:
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\run_windows_directml.ps1
+```
+
+Notes:
+- This path is separate from Docker and avoids NVIDIA-only runtime assumptions.
+- If `DmlExecutionProvider` is unavailable on your machine, runtime falls back to CPU.
+
 ## Docker Run
 ```bash
 cd face_recognition_system

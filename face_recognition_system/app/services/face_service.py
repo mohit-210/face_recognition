@@ -41,7 +41,7 @@ class FaceService:
         self.log_service = LogService(db)
         self.engine = get_recognition_engine()
         self.passive_antispoof = get_passive_antispoof_detector()
-        self.detector = FaceDetector()
+        self.detector = self.engine.detector
 
     @staticmethod
     def _invalidate_company_index(company_id: int) -> None:
@@ -94,6 +94,24 @@ class FaceService:
             return self.engine.embedder.get_embedding_fast(face_bgr), None
         except ValueError:
             return None, self._embedding_failure_hint(face_bgr)
+        except Exception:
+            logger.exception("Embedding runtime error in fast mode")
+            return None, "Embedding runtime error; please hold still and retry"
+
+    def _embed_detected_face_fast(
+        self,
+        image_bgr: np.ndarray,
+        det: dict,
+        face_bgr: np.ndarray,
+    ) -> tuple[np.ndarray | None, str | None]:
+        try:
+            return self.engine.embedder.get_embedding_from_detection(image_bgr, det), None
+        except ValueError:
+            # Fall back to detector-internal embedding path if landmarks are missing/invalid.
+            return self._embed_face_fast(face_bgr)
+        except Exception:
+            logger.exception("Embedding runtime error in detection-guided fast mode")
+            return None, "Embedding runtime error; please hold still and retry"
 
     def _embed_face_with_retries(
         self,
@@ -122,6 +140,9 @@ class FaceService:
                 emb = self.engine.embedder.get_embedding(candidate)
                 return emb, None
             except ValueError:
+                continue
+            except Exception:
+                logger.exception("Embedding runtime error in retry mode")
                 continue
 
         base_face = self.detector.crop_face(image_bgr, bbox, pad_ratio=0.22)
@@ -358,10 +379,12 @@ class FaceService:
     def identify_in_company(
         self,
         company_id: int,
-        image_base64: str,
+        image_base64: str | None,
         device_id: str | None,
         enforce_liveness: bool = True,
         previous_image_base64: str | None = None,
+        image_bgr: np.ndarray | None = None,
+        previous_image_bgr: np.ndarray | None = None,
         expected_challenge: str | None = None,
         challenge_response: str | None = None,
         require_live_motion: bool = False,
@@ -409,16 +432,23 @@ class FaceService:
             )
 
         t0 = time.perf_counter()
-        image = self.detector.decode_image(image_base64)
-        image = self._resize_for_identify(image, max_side=(512 if fast_mode else 640))
+        if image_bgr is not None:
+            image = image_bgr
+        else:
+            if not image_base64:
+                return _fail("Invalid image payload")
+            image = self.detector.decode_image(image_base64)
+        image = self._resize_for_identify(image, max_side=(384 if fast_mode else 640))
         timings["decode_ms"] += (time.perf_counter() - t0) * 1000.0
 
-        previous_image = None
-        if previous_image_base64:
+        previous_image = previous_image_bgr
+        if previous_image is not None:
+            previous_image = self._resize_for_identify(previous_image, max_side=(384 if fast_mode else 640))
+        elif previous_image_base64:
             try:
                 t0 = time.perf_counter()
                 previous_image = self.detector.decode_image(previous_image_base64)
-                previous_image = self._resize_for_identify(previous_image, max_side=(512 if fast_mode else 640))
+                previous_image = self._resize_for_identify(previous_image, max_side=(384 if fast_mode else 640))
                 timings["prev_decode_ms"] += (time.perf_counter() - t0) * 1000.0
             except ValueError:
                 previous_image = None
@@ -453,7 +483,7 @@ class FaceService:
             face = self.detector.crop_face(image, det["bbox"])
             t0 = time.perf_counter()
             if fast_mode:
-                query_emb, hint = self._embed_face_fast(face)
+                query_emb, hint = self._embed_detected_face_fast(image, det, face)
             else:
                 candidates = self._recommended_embed_candidates(face, fast_mode=fast_mode)
                 query_emb, hint = self._embed_face_with_retries(image, det["bbox"], max_candidates=candidates)
@@ -618,7 +648,7 @@ class FaceService:
 
             t0 = time.perf_counter()
             if fast_mode:
-                query_emb, hint = self._embed_face_fast(face)
+                query_emb, hint = self._embed_detected_face_fast(image, det, face)
             else:
                 candidates = self._recommended_embed_candidates(face, fast_mode=fast_mode)
                 query_emb, hint = self._embed_face_with_retries(image, det["bbox"], max_candidates=candidates)
@@ -644,6 +674,7 @@ class FaceService:
             best_similarity = float(scores[best_idx])
             best_user_id = int(user_ids[best_idx])
             best_user_name = name_by_user.get(best_user_id)
+
         timings["match_ms"] += (time.perf_counter() - t0) * 1000.0
 
         required_recognition = self.engine.settings.recognition_threshold

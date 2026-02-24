@@ -10,11 +10,13 @@ import 'flutter_face_api_client.dart';
 class _BlinkFrameSample {
   _BlinkFrameSample({
     required this.bytes,
+    required this.hasFace,
     this.leftEyeOpen,
     this.rightEyeOpen,
   });
 
   final Uint8List bytes;
+  final bool hasFace;
   final double? leftEyeOpen;
   final double? rightEyeOpen;
 }
@@ -27,7 +29,7 @@ class FaceOpsPage extends StatefulWidget {
 }
 
 class _FaceOpsPageState extends State<FaceOpsPage> {
-  final TextEditingController _baseUrlCtrl = TextEditingController(text: 'http://192.168.1.69:8000');
+  final TextEditingController _baseUrlCtrl = TextEditingController(text: 'http://192.168.29.125:8001');
   final TextEditingController _companyIdCtrl = TextEditingController();
   final TextEditingController _adminCodeCtrl = TextEditingController();
   final TextEditingController _adminPasswordCtrl = TextEditingController();
@@ -65,13 +67,14 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
   AttendanceScanResponse? _pendingAttendanceCandidate;
   static const int _attendanceBurstFrames = 2;
   static const Duration _attendanceBurstGap = Duration(milliseconds: 110);
-  static const int _mobileFrameMaxWidth = 512;
+  static const int _mobileFrameMaxWidth = 384;
   static const int _blinkBurstFramesOpen = 1;
   static const int _blinkBurstFramesBlink = 1;
   static const Duration _blinkOpenGap = Duration(milliseconds: 80);
   static const Duration _blinkActionGap = Duration(milliseconds: 80);
   static const Duration _blinkLeadDelay = Duration(milliseconds: 120);
   static const Duration _blinkDetectWindow = Duration(seconds: 6);
+  static const Duration _blinkApiTimeout = Duration(seconds: 20);
   static const double _eyeOpenThreshold = 0.68;
   static const double _eyeClosedThreshold = 0.38;
   static const String _monitorDeviceId = 'flutter-attendance-monitor';
@@ -205,10 +208,12 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
       final normalized = await _normalizeFrameBytes(bytes, maxWidth: _mobileFrameMaxWidth);
       double? leftEyeOpen;
       double? rightEyeOpen;
+      var hasFace = false;
       try {
         final inputImage = InputImage.fromFilePath(file.path);
         final faces = await _blinkFaceDetector.processImage(inputImage);
         if (faces.isNotEmpty) {
+          hasFace = true;
           leftEyeOpen = faces.first.leftEyeOpenProbability;
           rightEyeOpen = faces.first.rightEyeOpenProbability;
         }
@@ -217,6 +222,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
       }
       return _BlinkFrameSample(
         bytes: normalized,
+        hasFace: hasFace,
         leftEyeOpen: leftEyeOpen,
         rightEyeOpen: rightEyeOpen,
       );
@@ -323,7 +329,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
     } on SocketException catch (e) {
       setState(() {
         _status =
-            'Login failed: cannot reach ${_baseUrlCtrl.text}. '
+        'Login failed: cannot reach ${_baseUrlCtrl.text}. '
             'Ensure API is running and phone/laptop are on same Wi-Fi. ($e)';
       });
     } on FaceApiException catch (e) {
@@ -394,7 +400,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
       if (mounted) {
         setState(() {
           _attendanceStatus =
-              'Monitor: live=${result.livenessScore.toStringAsFixed(3)}'
+          'Monitor: live=${result.livenessScore.toStringAsFixed(3)}'
               '${_thresholdSummary(result.livenessThresholdUsed)}'
               ' | pass=${pass ? "YES" : "NO"}'
               ' | conf=${result.confidence.toStringAsFixed(3)}'
@@ -427,7 +433,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
       _attendanceMonitorTimer?.cancel();
       _attendanceMonitorTimer = Timer.periodic(
         const Duration(milliseconds: 380),
-        (_) => _attendanceMonitorTick(),
+            (_) => _attendanceMonitorTick(),
       );
       setState(() {
         _attendanceStatus = 'Live threshold monitoring started.';
@@ -481,7 +487,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
         setState(() {
           _pendingAttendanceCandidate = burst;
           _attendanceStatus =
-              'Verified: ${burst.name} (not marked yet)'
+          'Verified: ${burst.name} (not marked yet)'
               ' | conf=${burst.confidence.toStringAsFixed(3)}'
               ' | live=${burst.livenessScore.toStringAsFixed(3)}'
               '${_thresholdSummary(burst.livenessThresholdUsed)}'
@@ -509,22 +515,35 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
     final client = _apiClient;
     if (_busy || !_loggedIn || client == null) return;
 
+    final qualityBeforeVerify = _captureQuality;
+    if (_captureQuality != 'low') {
+      await _setCaptureQuality('low');
+    }
+
     setState(() {
       _busy = true;
       _verifyStatus = 'Blink verify: keep eyes open...';
     });
 
     try {
+      final verifyStart = DateTime.now();
       _BlinkFrameSample? openSample;
       bool sawProbabilities = false;
       final deadline = DateTime.now().add(_blinkDetectWindow);
       int attempts = 0;
       AttendanceScanResponse? result;
+      var detectMs = 0;
+      var apiMs = 0;
 
       while (DateTime.now().isBefore(deadline)) {
         attempts += 1;
         final sample = await _captureBlinkSample();
         if (sample == null || sample.bytes.isEmpty) {
+          await Future<void>.delayed(_blinkActionGap);
+          continue;
+        }
+        if (!sample.hasFace) {
+          setState(() => _verifyStatus = 'No face detected. Center your face in frame.');
           await Future<void>.delayed(_blinkActionGap);
           continue;
         }
@@ -534,23 +553,28 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
 
         if (openSample == null) {
           if (_isEyesOpen(sample)) {
+            // Frame 1: capture when ML Kit confirms eyes-open baseline.
             openSample = sample;
             setState(() => _verifyStatus = 'Open eyes detected. Blink now...');
           } else {
-            setState(() => _verifyStatus = 'Align face and keep eyes open...');
+            setState(() => _verifyStatus = 'Face detected. Keep eyes open for baseline...');
           }
           await Future<void>.delayed(_blinkOpenGap);
           continue;
         }
 
         if (_isEyesClosed(sample)) {
+          // Frame 2: capture when ML Kit confirms blink/eyes-closed.
           setState(() => _verifyStatus = 'Blink captured. Verifying, please wait...');
           setState(() => _verifyApiInFlight = true);
+          detectMs = DateTime.now().difference(verifyStart).inMilliseconds;
+          final apiStart = DateTime.now();
           result = await _scanFaceForAttendanceWithBlink(
             client: client,
             imageBytes: sample.bytes,
             previousImageBytes: openSample.bytes,
-          );
+          ).timeout(_blinkApiTimeout);
+          apiMs = DateTime.now().difference(apiStart).inMilliseconds;
           if (mounted) {
             setState(() => _verifyApiInFlight = false);
           }
@@ -567,13 +591,13 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
       if (result == null) {
         if (!sawProbabilities) {
           setState(
-            () => _verifyStatus =
-                'Blink detect unavailable on this device frame. Keep better lighting and face centered, then retry.',
+                () => _verifyStatus =
+            'Blink detect unavailable on this device frame. Keep better lighting and face centered, then retry.',
           );
         } else {
           setState(
-            () => _verifyStatus =
-                'Blink not detected in ${_blinkDetectWindow.inSeconds}s (samples=$attempts). '
+                () => _verifyStatus =
+            'Blink not detected in ${_blinkDetectWindow.inSeconds}s (samples=$attempts). '
                 'Keep face stable, eyes open first, then blink once.',
           );
         }
@@ -582,9 +606,11 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
 
       setState(() {
         _verifyStatus =
-            '${result!.verified ? "VERIFIED" : "REJECTED"}'
+        '${result!.verified ? "VERIFIED" : "REJECTED"}'
             ' | conf=${result.confidence.toStringAsFixed(3)}'
             ' | live=${result.livenessScore.toStringAsFixed(3)}'
+            ' | detect=${detectMs}ms'
+            ' | api=${apiMs}ms'
             '${_thresholdSummary(result.livenessThresholdUsed)}'
             '${_modelSummary(result.modelUsed)}'
             '${_timingSummary(result.debugTimings)}'
@@ -594,6 +620,9 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
     } catch (e) {
       setState(() => _verifyStatus = 'Blink verify failed: ${_readableError(e)}');
     } finally {
+      if (qualityBeforeVerify != _captureQuality) {
+        await _setCaptureQuality(qualityBeforeVerify);
+      }
       if (mounted) setState(() => _verifyApiInFlight = false);
       if (mounted) setState(() => _busy = false);
     }
@@ -643,7 +672,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
         _lastMarked = marked;
         _pendingAttendanceCandidate = null;
         _attendanceStatus =
-            'Marked: ${pending.name} | ${marked.action.replaceAll('_', ' ')}'
+        'Marked: ${pending.name} | ${marked.action.replaceAll('_', ' ')}'
             ' | status=${marked.record.status}'
             ' | from pre-scan'
             ' | conf=${pending.confidence.toStringAsFixed(3)}'
@@ -696,6 +725,9 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
 
   String _readableError(Object error) {
     if (error is FaceApiException) return error.message;
+    if (error is TimeoutException) {
+      return 'API timeout. Server processing exceeded ${_blinkApiTimeout.inSeconds}s.';
+    }
     return error.toString();
   }
 
@@ -758,7 +790,7 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
                     alignment: Alignment.centerLeft,
                     child: Text(
                       'Status: $_status | Camera quality: $_captureQuality'
-                      ' | url=${_activeBaseUrl ?? "-"} | company_id=${_activeCompanyId ?? "-"}',
+                          ' | url=${_activeBaseUrl ?? "-"} | company_id=${_activeCompanyId ?? "-"}',
                     ),
                   ),
                 ],
@@ -888,11 +920,11 @@ class _FaceOpsPageState extends State<FaceOpsPage> {
   }
 
   Widget _input(
-    TextEditingController ctrl,
-    String label, {
-    bool obscure = false,
-    TextInputType type = TextInputType.text,
-  }) {
+      TextEditingController ctrl,
+      String label, {
+        bool obscure = false,
+        TextInputType type = TextInputType.text,
+      }) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
       child: TextField(
