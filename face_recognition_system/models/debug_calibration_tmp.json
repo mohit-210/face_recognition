@@ -1,0 +1,15 @@
+{
+  "threshold_eer": 0.282120019197464,
+  "eer": 0.12855773283307748,
+  "val_auc_best": 0.9420995604262712,
+  "val_acc_best": 0.8714749188919391,
+  "score_bias": 0.0,
+  "onnx": {
+    "preprocess": "keras_legacy",
+    "live_index": 0,
+    "temperature": 1.0,
+    "clip_runtime": false,
+    "input_size": 128
+  },
+  "notes": "ONNX calibration generated from evaluate_passive_antispoof_onnx.py"
+}
