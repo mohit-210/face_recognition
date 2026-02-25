@@ -7,20 +7,27 @@ Thumbs.db
 # Python
 __pycache__/
 *.py[cod]
+*.cpython-*.pyc
 *.pyo
 *.pyd
+.Python
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
 .coverage.*
 htmlcov/
+.ipynb_checkpoints/
 
 # Virtual environments
 .venv/
 .venv*/
 venv/
 env/
+**/.venv/
+**/.venv*/
+**/venv/
+**/env/
 
 # Env files / secrets
 .env
