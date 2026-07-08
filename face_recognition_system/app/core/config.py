@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     refresh_token_expire_minutes: int = 60 * 24 * 7
 
     session_secret_key: str = "change-admin-session-secret"
+    face_engine_key: str = "change-face-engine-key"
 
     recognition_threshold: float = Field(default=0.45, ge=0.0, le=1.0)
     liveness_threshold: float = Field(default=0.77, ge=0.0, le=1.0)
@@ -50,6 +51,7 @@ class Settings(BaseSettings):
     arcface_ctx_id: int = Field(default=-1, ge=-1, le=8)
     arcface_det_size: int = Field(default=320, ge=320, le=1280)
     retinaface_min_score: float = Field(default=0.70, ge=0.0, le=1.0)
+    engine_max_image_bytes: int = Field(default=5 * 1024 * 1024, ge=1024, le=20 * 1024 * 1024)
 
     model_path: str = "./models"
 

@@ -356,6 +356,23 @@ class PassiveAntiSpoofDetector:
         crop = image_bgr[y1:y2, x1:x2]
         return crop
 
+    @staticmethod
+    def _center_crop(face_bgr: np.ndarray, keep_ratio: float = 0.72) -> np.ndarray:
+        """
+        Use center-biased crop so background color/brightness has less impact.
+        """
+        if face_bgr is None or face_bgr.size == 0:
+            return face_bgr
+        h, w = face_bgr.shape[:2]
+        ratio = float(np.clip(keep_ratio, 0.45, 1.0))
+        ch = max(1, int(round(h * ratio)))
+        cw = max(1, int(round(w * ratio)))
+        y1 = max(0, (h - ch) // 2)
+        x1 = max(0, (w - cw) // 2)
+        y2 = min(h, y1 + ch)
+        x2 = min(w, x1 + cw)
+        return face_bgr[y1:y2, x1:x2]
+
     def _preprocess_celeba(self, face_bgr: np.ndarray, out_size: int) -> np.ndarray:
         mode = str(getattr(self.settings, "passive_antispoof_onnx_preprocess", "minifasnet") or "minifasnet")
         return PassiveAntiSpoofDetector.preprocess(
@@ -393,7 +410,9 @@ class PassiveAntiSpoofDetector:
         return cv2.cvtColor(merged, cv2.COLOR_YCrCb2BGR)
 
     def _environment_check(self, face_bgr: np.ndarray) -> tuple[str | None, float]:
-        gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
+        # Evaluate blur/brightness on face core to avoid false rejects from bright backgrounds.
+        core = self._center_crop(face_bgr, keep_ratio=0.72)
+        gray = cv2.cvtColor(core, cv2.COLOR_BGR2GRAY)
         blur_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
         brightness = float(np.mean(gray))
         soft_penalty = 0.0
@@ -525,9 +544,11 @@ class PassiveAntiSpoofDetector:
         # Base prediction first.
         if onnx_session is not None and self.onnx_input_name and self.onnx_output_name:
             preprocess_size = int(self.onnx_input_size or self.settings.passive_antispoof_onnx_input_size or 224)
-            crop = self._crop_scaled(image_bgr, bbox, scale=2.5)
+            # Keep ONNX crop tighter around face; large context makes white backgrounds dominate.
+            crop = self._crop_scaled(image_bgr, bbox, scale=1.45)
             if crop.size == 0:
                 crop = face_bgr
+            crop = self._center_crop(crop, keep_ratio=0.86)
             onnx_input = self._preprocess_celeba(crop, out_size=preprocess_size)
             pred = onnx_session.run(
                 [self.onnx_output_name],
@@ -557,9 +578,10 @@ class PassiveAntiSpoofDetector:
         if 0.30 <= base_conf <= 0.75:
             if onnx_session is not None and self.onnx_input_name and self.onnx_output_name:
                 preprocess_size = int(self.onnx_input_size or self.settings.passive_antispoof_onnx_input_size or 224)
-                crop = self._crop_scaled(image_bgr, bbox, scale=2.5)
+                crop = self._crop_scaled(image_bgr, bbox, scale=1.45)
                 if crop.size == 0:
                     crop = face_bgr
+                crop = self._center_crop(crop, keep_ratio=0.86)
                 face_flip = cv2.flip(crop, 1)
                 face_luma = self._enhance_luma(crop)
                 tta_inputs = [
@@ -629,3 +651,141 @@ class PassiveAntiSpoofDetector:
         if face_bgr.size == 0:
             return PassiveLivenessResult(confidence=0.0, environmental_error="Environmental Error: empty face crop")
         return self.score_from_image(face_bgr, [0, 0, face_bgr.shape[1], face_bgr.shape[0]], face_bgr=face_bgr)
+
+
+@dataclass
+class LivenessDecision:
+    risk_score: float
+    decision: str  # "accept", "reject", "step_up"
+    reason: str
+
+
+class EnterprisePassiveLiveness:
+    """
+    Sequence-level enterprise scorer layered on top of ONNX liveness output.
+    Keeps existing detector intact and provides an optional 3-zone decision.
+    """
+
+    def __init__(
+        self,
+        onnx_path: str,
+        input_size: int = 224,
+        live_index: int = 1,
+        low_threshold: float = 0.45,
+        high_threshold: float = 0.65,
+        providers: list[str] | None = None,
+    ) -> None:
+        if ort is None:
+            raise RuntimeError("onnxruntime is not available")
+        eps = list(providers) if providers else ["CPUExecutionProvider"]
+        self.session = ort.InferenceSession(str(onnx_path), providers=eps)
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_name = self.session.get_outputs()[0].name
+        self.input_size = int(input_size)
+        self.live_index = int(live_index)
+        self.low_threshold = float(low_threshold)
+        self.high_threshold = float(high_threshold)
+        self.frame_buffer: list[np.ndarray] = []
+
+    def _preprocess(self, face_bgr: np.ndarray) -> np.ndarray:
+        resized = cv2.resize(face_bgr, (self.input_size, self.input_size))
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32)
+        rgb = (rgb - 127.5) / 128.0
+        chw = np.transpose(rgb, (2, 0, 1))
+        return np.expand_dims(chw, axis=0).astype(np.float32)
+
+    def _onnx_to_confidence(self, output: np.ndarray) -> float:
+        arr = np.asarray(output).reshape(-1)
+        if arr.size == 1:
+            val = float(arr[0])
+            return float(val if 0.0 <= val <= 1.0 else (1.0 / (1.0 + np.exp(-val))))
+        if arr.size == 2:
+            logits = arr - np.max(arr)
+            probs = np.exp(logits) / max(1e-6, float(np.sum(np.exp(logits))))
+            idx = int(np.clip(self.live_index, 0, 1))
+            return float(probs[idx])
+        raise RuntimeError("Unsupported model output shape")
+
+    @staticmethod
+    def _frequency_replay_score(face_gray: np.ndarray) -> float:
+        fft = np.fft.fft2(face_gray)
+        mag = np.log1p(np.abs(fft))
+        h, w = mag.shape[:2]
+        y1, y2 = int(0.25 * h), int(0.75 * h)
+        x1, x2 = int(0.25 * w), int(0.75 * w)
+        high_freq_energy = float(np.mean(mag[y1:y2, x1:x2]))
+        return float(np.clip(high_freq_energy / 10.0, 0.0, 1.0))
+
+    def _temporal_motion_score(self) -> float:
+        if len(self.frame_buffer) < 5:
+            return 0.5
+        motions: list[float] = []
+        for i in range(1, len(self.frame_buffer)):
+            prev = cv2.cvtColor(self.frame_buffer[i - 1], cv2.COLOR_BGR2GRAY)
+            curr = cv2.cvtColor(self.frame_buffer[i], cv2.COLOR_BGR2GRAY)
+            flow = cv2.calcOpticalFlowFarneback(prev, curr, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+            mag = np.sqrt((flow[..., 0] ** 2) + (flow[..., 1] ** 2))
+            motions.append(float(np.mean(mag)))
+        motion_var = float(np.var(motions)) if motions else 0.0
+        return float(np.clip(motion_var * 10.0, 0.0, 1.0))
+
+    def _predict_with_tta(self, face: np.ndarray) -> float:
+        faces = [face, cv2.flip(face, 1), cv2.GaussianBlur(face, (3, 3), 0)]
+        preds: list[float] = []
+        for f in faces:
+            inp = self._preprocess(f)
+            out = self.session.run([self.output_name], {self.input_name: inp})[0]
+            preds.append(self._onnx_to_confidence(out))
+        return float(np.median(preds))
+
+    @staticmethod
+    def _clamp_bbox(bbox: list[int], width: int, height: int) -> tuple[int, int, int, int]:
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        x1 = max(0, min(x1, max(0, width - 1)))
+        y1 = max(0, min(y1, max(0, height - 1)))
+        x2 = max(x1 + 1, min(x2, width))
+        y2 = max(y1 + 1, min(y2, height))
+        return x1, y1, x2, y2
+
+    def score_sequence(self, frames: list[np.ndarray], bbox: list[int]) -> LivenessDecision:
+        self.frame_buffer = frames[-20:] if frames else []
+        base_scores: list[float] = []
+        freq_scores: list[float] = []
+
+        for frame in self.frame_buffer:
+            if frame is None or frame.size == 0:
+                continue
+            h, w = frame.shape[:2]
+            x1, y1, x2, y2 = self._clamp_bbox(bbox, w, h)
+            face = frame[y1:y2, x1:x2]
+            if face.size == 0:
+                continue
+            base_scores.append(self._predict_with_tta(face))
+            gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
+            freq_scores.append(self._frequency_replay_score(gray))
+
+        if not base_scores:
+            return LivenessDecision(1.0, "reject", "no_face_detected")
+
+        rgb_score = float(np.median(base_scores))
+        freq_score = float(np.median(freq_scores)) if freq_scores else 0.5
+        temporal_score = self._temporal_motion_score()
+
+        risk_score = float(np.clip((0.55 * rgb_score) + (0.25 * temporal_score) - (0.20 * freq_score), 0.0, 1.0))
+
+        if risk_score >= self.high_threshold:
+            decision = "accept"
+        elif risk_score <= self.low_threshold:
+            decision = "reject"
+        else:
+            decision = "step_up"
+
+        logger.info(
+            "Enterprise passive: RGB=%.3f TEMP=%.3f FREQ=%.3f RISK=%.3f DECISION=%s",
+            rgb_score,
+            temporal_score,
+            freq_score,
+            risk_score,
+            decision,
+        )
+        return LivenessDecision(risk_score=risk_score, decision=decision, reason="enterprise_fusion")

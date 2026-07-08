@@ -68,4 +68,5 @@ face_recognition_system/models/passive_antispoof_eval_report*.json
 .flutter-plugins-dependencies
 .packages
 **/build/
+laravel_face_recognition/
 
