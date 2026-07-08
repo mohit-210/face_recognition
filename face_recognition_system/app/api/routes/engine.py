@@ -3,12 +3,25 @@ import base64
 import cv2
 import numpy as np
 from fastapi import APIRouter, Header, HTTPException
+from functools import lru_cache
 from pydantic import BaseModel, Field
 
 from app.core.config import get_settings
-from app.services.face_service import get_recognition_engine
+from app.vision.embedder import FaceEmbedder
 
 router = APIRouter(prefix="/engine", tags=["Face Engine"])
+
+
+@lru_cache(maxsize=1)
+def get_engine_embedder() -> FaceEmbedder:
+    return FaceEmbedder()
+
+
+def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
+    denom = np.linalg.norm(vec1) * np.linalg.norm(vec2)
+    if denom == 0:
+        return 0.0
+    return float(np.dot(vec1, vec2) / denom)
 
 
 class EmbedRequest(BaseModel):
@@ -57,11 +70,11 @@ def _quality_score(image_bgr: np.ndarray) -> float:
 @router.get("/health")
 def engine_health(x_face_engine_key: str | None = Header(default=None)):
     _require_engine_key(x_face_engine_key)
-    engine = get_recognition_engine()
+    embedder = get_engine_embedder()
     return {
         "status": "ok",
-        "model": engine.embedder.model_name,
-        "providers": engine.embedder.providers or ["default"],
+        "model": embedder.model_name,
+        "providers": embedder.providers or ["default"],
     }
 
 
@@ -69,9 +82,9 @@ def engine_health(x_face_engine_key: str | None = Header(default=None)):
 def embed(payload: EmbedRequest, x_face_engine_key: str | None = Header(default=None)):
     _require_engine_key(x_face_engine_key)
     image = _decode_image(payload.image_base64)
-    engine = get_recognition_engine()
+    embedder = get_engine_embedder()
     try:
-        embedding, face_count = engine.embedder.get_best_embedding(image)
+        embedding, face_count = embedder.get_best_embedding(image)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -80,7 +93,7 @@ def embed(payload: EmbedRequest, x_face_engine_key: str | None = Header(default=
         "face_count": int(face_count),
         "quality_score": _quality_score(image),
         "embedding": [float(v) for v in embedding.tolist()],
-        "model": engine.embedder.model_name,
+        "model": embedder.model_name,
     }
 
 
@@ -91,5 +104,5 @@ def compare(payload: CompareRequest, x_face_engine_key: str | None = Header(defa
         raise HTTPException(status_code=422, detail="Both embeddings are required")
     vec_a = np.asarray(payload.embedding_a, dtype=np.float32)
     vec_b = np.asarray(payload.embedding_b, dtype=np.float32)
-    score = get_recognition_engine().cosine_similarity(vec_a, vec_b)
+    score = cosine_similarity(vec_a, vec_b)
     return {"score": float(score)}

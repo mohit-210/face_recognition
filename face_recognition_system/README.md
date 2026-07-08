@@ -48,10 +48,34 @@ LIVENESS_THRESHOLD=0.65
 ```
 
 ## Local Run
+### Lightweight Laravel Face Engine
+Use this when the Laravel project is the main app and Python only provides ArcFace embeddings.
+
+1. Install only engine dependencies:
+```bash
+cd face_recognition_system
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+2. Start the engine:
+```bash
+uvicorn app.engine_main:app --host 127.0.0.1 --port 9001
+```
+
+3. Test:
+```bash
+curl -H "X-Face-Engine-Key: change-face-engine-key" http://127.0.0.1:9001/engine/health
+```
+
+The old all-in-one Python app dependencies are kept in `requirements.full.txt`.
+
+### Full Legacy Python API
 1. Install dependencies:
 ```bash
 cd face_recognition_system
-pip install -r requirements.txt
+pip install -r requirements.full.txt
 ```
 2. Start PostgreSQL.
 3. Run migrations:
