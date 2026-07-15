@@ -1,19 +1,9 @@
-# Runtime dependencies for the FastAPI API, Docker image, and Windows DirectML setup.
+# Runtime dependencies for the Laravel-facing face engine.
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
-sqlalchemy==2.0.37
-psycopg2-binary==2.9.10
-alembic==1.14.1
-python-jose[cryptography]==3.3.0
-bcrypt==4.2.1
 pydantic==2.10.5
 pydantic-settings==2.7.1
-jinja2==3.1.4
 numpy==2.2.1
 opencv-python-headless==4.10.0.84
 insightface==0.7.3
 onnxruntime==1.20.1
-retina-face==0.0.17
-python-multipart==0.0.20
-openpyxl==3.1.5
-reportlab==4.2.5

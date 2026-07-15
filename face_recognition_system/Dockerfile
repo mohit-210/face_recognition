@@ -5,4 +5,4 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 COPY requirements.txt /app/requirements.txt
 RUN PIP_REQUIRE_HASHES=0 pip install --no-cache-dir -r /app/requirements.txt
 COPY . /app
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.engine_main:app", "--host", "0.0.0.0", "--port", "9001"]
