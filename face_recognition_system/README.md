@@ -48,10 +48,36 @@ LIVENESS_THRESHOLD=0.65
 ```
 
 ## Local Run
-### Lightweight Laravel Face Engine
-Use this when the Laravel project is the main app and Python only provides ArcFace embeddings.
+### Full Python API
+Use this for the FastAPI app, Docker image, admin UI, migrations, face engine, and attendance exports.
 
-1. Install only engine dependencies:
+1. Install runtime dependencies:
+```bash
+cd face_recognition_system
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+2. Start PostgreSQL.
+
+3. Run migrations:
+```bash
+cd face_recognition_system
+alembic -c alembic.ini upgrade head
+```
+
+4. Start the API:
+```bash
+uvicorn app.main:app --reload --port 8000
+```
+
+5. Open docs: `http://localhost:8000/docs`
+
+### Lightweight Laravel Face Engine
+Use this when the Laravel project is the main app and Python only provides ArcFace embeddings. It currently uses the same runtime requirements because the engine shares the app configuration and embedder modules.
+
+1. Install runtime dependencies:
 ```bash
 cd face_recognition_system
 python -m venv .venv
@@ -69,25 +95,13 @@ uvicorn app.engine_main:app --host 127.0.0.1 --port 9001
 curl -H "X-Face-Engine-Key: change-face-engine-key" http://127.0.0.1:9001/engine/health
 ```
 
-The old all-in-one Python app dependencies are kept in `requirements.full.txt`.
+### Optional ML Utility Scripts
+Install the extended requirements only when you need the training/evaluation/export helpers in `scripts/`.
 
-### Full Legacy Python API
-1. Install dependencies:
 ```bash
 cd face_recognition_system
 pip install -r requirements.full.txt
 ```
-2. Start PostgreSQL.
-3. Run migrations:
-```bash
-cd face_recognition_system
-alembic -c alembic.ini upgrade head
-```
-4. Start API:
-```bash
-uvicorn app.main:app --reload --port 8000
-```
-5. Open docs: `http://localhost:8000/docs`
 
 ### Windows Intel GPU (DirectML) Run
 Use this if you want Intel Iris Xe acceleration for ONNX liveness on Windows (outside Docker).

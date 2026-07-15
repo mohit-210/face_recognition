@@ -1,20 +1,11 @@
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-sqlalchemy==2.0.37
-psycopg2-binary==2.9.10
-alembic==1.14.1
-python-jose[cryptography]==3.3.0
-passlib[bcrypt]==1.7.4
-pydantic==2.10.5
-pydantic-settings==2.7.1
-jinja2==3.1.4
-numpy==2.2.1
-opencv-python==4.10.0.84
-retina-face==0.0.17
-insightface==0.7.3
-onnxruntime==1.20.1
-python-multipart==0.0.20
+-r requirements.txt
+
+# Optional dependencies for scripts under scripts/.
+scikit-learn==1.6.1
+tensorflow==2.20.0
 tf-keras==2.20.1
-itsdangerous==2.2.0
-openpyxl==3.1.5
-reportlab==4.2.5
+Pillow==11.1.0
+pyarrow==19.0.0
+torch==2.5.1
+timm==1.0.14
+onnx==1.17.0

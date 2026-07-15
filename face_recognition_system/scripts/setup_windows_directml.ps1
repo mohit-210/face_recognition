@@ -16,7 +16,7 @@ Write-Host "Using venv Python: $python"
 
 & $python -m pip install --upgrade pip
 
-# Base dependencies first.
+# Runtime dependencies first.
 & $python -m pip install -r requirements.txt
 
 # Switch ONNX runtime package to DirectML on Windows.
