@@ -12,7 +12,12 @@ ENV INSIGHTFACE_HOME=/opt/insightface \
     NUMEXPR_NUM_THREADS=2
 
 COPY requirements.txt ${LAMBDA_TASK_ROOT}/
-RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt --target ${LAMBDA_TASK_ROOT}
+# InsightFace is distributed as a source package and requests an unpinned NumPy
+# build dependency. Install our compatible NumPy wheel first, then disable build
+# isolation so pip does not attempt to compile a newer NumPy in the Lambda image.
+RUN pip install --no-cache-dir --target ${LAMBDA_TASK_ROOT} numpy==2.2.1 setuptools wheel \
+    && PYTHONPATH=${LAMBDA_TASK_ROOT} pip install --no-cache-dir --no-build-isolation \
+        --target ${LAMBDA_TASK_ROOT} -r ${LAMBDA_TASK_ROOT}/requirements.txt
 
 COPY app ${LAMBDA_TASK_ROOT}/app
 
