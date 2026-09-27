@@ -1,6 +1,6 @@
-# Build InsightFace's native extension in AWS's Amazon Linux build image so the
-# generated binary is compatible with the Lambda Python 3.11 runtime.
-FROM public.ecr.aws/sam/build-python3.11 AS build
+# Build with the same Amazon Linux 2023 base as the Lambda Python 3.11 runtime.
+# The older SAM Python 3.11 build image cannot accept the onnxruntime 1.20 wheel.
+FROM public.ecr.aws/lambda/python:3.11 AS build
 
 WORKDIR /build
 COPY requirements.txt ./
@@ -8,7 +8,9 @@ COPY requirements.txt ./
 # InsightFace 0.7.3 is distributed as source. Its setup needs both NumPy and
 # Cython; --no-build-isolation prevents pip from attempting to build an
 # unpinned newer NumPy in an isolated environment.
-RUN pip install --no-cache-dir --target /python numpy==2.2.1 setuptools wheel Cython \
+RUN dnf install -y gcc gcc-c++ make \
+    && dnf clean all \
+    && pip install --no-cache-dir --target /python numpy==2.2.1 setuptools wheel Cython \
     && PYTHONPATH=/python pip install --no-cache-dir --no-build-isolation \
         --target /python -r requirements.txt
 
