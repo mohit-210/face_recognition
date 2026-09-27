@@ -1,0 +1,103 @@
+name: Deploy Face Engine to AWS Lambda
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "face_recognition_system/**"
+      - ".github/workflows/deploy-lambda.yml"
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  LAMBDA_FUNCTION_NAME: ${{ vars.LAMBDA_FUNCTION_NAME }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to AWS using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create ECR repository if it does not exist
+        run: |
+          aws ecr describe-repositories \
+            --repository-names "$ECR_REPOSITORY" \
+            --region "$AWS_REGION" \
+            || aws ecr create-repository \
+              --repository-name "$ECR_REPOSITORY" \
+              --region "$AWS_REGION"
+
+      - name: Sign in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and upload the Lambda image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            -f face_recognition_system/Dockerfile.lambda \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            face_recognition_system
+
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+      - name: Create or update Lambda
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          FACE_ENGINE_KEY: ${{ secrets.FACE_ENGINE_KEY }}
+          LAMBDA_RUNTIME_ROLE_ARN: ${{ secrets.LAMBDA_RUNTIME_ROLE_ARN }}
+        run: |
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          if aws lambda get-function \
+            --function-name "$LAMBDA_FUNCTION_NAME" \
+            --region "$AWS_REGION" >/dev/null 2>&1; then
+
+            aws lambda update-function-configuration \
+              --function-name "$LAMBDA_FUNCTION_NAME" \
+              --memory-size 3008 \
+              --timeout 29 \
+              --environment "Variables={FACE_ENGINE_KEY=$FACE_ENGINE_KEY}" \
+              --region "$AWS_REGION"
+
+            aws lambda wait function-updated \
+              --function-name "$LAMBDA_FUNCTION_NAME" \
+              --region "$AWS_REGION"
+
+            aws lambda update-function-code \
+              --function-name "$LAMBDA_FUNCTION_NAME" \
+              --image-uri "$IMAGE_URI" \
+              --region "$AWS_REGION"
+
+          else
+            aws lambda create-function \
+              --function-name "$LAMBDA_FUNCTION_NAME" \
+              --package-type Image \
+              --code "ImageUri=$IMAGE_URI" \
+              --role "$LAMBDA_RUNTIME_ROLE_ARN" \
+              --architectures x86_64 \
+              --memory-size 3008 \
+              --timeout 29 \
+              --environment "Variables={FACE_ENGINE_KEY=$FACE_ENGINE_KEY}" \
+              --region "$AWS_REGION"
+          fi
+
+          aws lambda wait function-updated \
+            --function-name "$LAMBDA_FUNCTION_NAME" \
+            --region "$AWS_REGION"
