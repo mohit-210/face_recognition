@@ -1,0 +1,50 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Face recognition engine running as a Lambda container image.
+
+Parameters:
+  FaceEngineKey:
+    Type: String
+    NoEcho: true
+    MinLength: 24
+    Description: Secret required in the X-Face-Engine-Key request header.
+
+Globals:
+  Function:
+    Timeout: 29
+    MemorySize: 3008
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        FACE_ENGINE_KEY: !Ref FaceEngineKey
+        ARCFACE_MODEL_NAME: buffalo_s
+        ARCFACE_ONNX_PROVIDERS: CPUExecutionProvider
+        ARCFACE_CTX_ID: '-1'
+        ARCFACE_DET_SIZE: '320'
+        ENGINE_MAX_IMAGE_BYTES: '5242880'
+        OMP_NUM_THREADS: '2'
+        OPENBLAS_NUM_THREADS: '2'
+        MKL_NUM_THREADS: '2'
+        NUMEXPR_NUM_THREADS: '2'
+
+Resources:
+  FaceEngineFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      DockerTag: face-engine-v1
+      DockerContext: .
+      Dockerfile: Dockerfile.lambda
+    Properties:
+      PackageType: Image
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /{proxy+}
+            Method: ANY
+
+Outputs:
+  FaceEngineApiUrl:
+    Description: Base URL for Laravel FACE_ENGINE_URL.
+    Value: !Sub 'https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com'

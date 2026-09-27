@@ -1,0 +1,23 @@
+# Lambda container image. Build from the face_recognition_system directory.
+FROM public.ecr.aws/lambda/python:3.11
+
+ENV INSIGHTFACE_HOME=/opt/insightface \
+    ARCFACE_MODEL_NAME=buffalo_s \
+    ARCFACE_ONNX_PROVIDERS=CPUExecutionProvider \
+    ARCFACE_CTX_ID=-1 \
+    ARCFACE_DET_SIZE=320 \
+    OMP_NUM_THREADS=2 \
+    OPENBLAS_NUM_THREADS=2 \
+    MKL_NUM_THREADS=2 \
+    NUMEXPR_NUM_THREADS=2
+
+COPY requirements.txt ${LAMBDA_TASK_ROOT}/
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt --target ${LAMBDA_TASK_ROOT}
+
+COPY app ${LAMBDA_TASK_ROOT}/app
+
+# InsightFace normally downloads this model on its first inference. Lambda's
+# filesystem is read-only except /tmp, so download it while building instead.
+RUN python -c "from insightface.app import FaceAnalysis; model = FaceAnalysis(name='buffalo_s', providers=['CPUExecutionProvider']); model.prepare(ctx_id=-1, det_size=(320, 320))"
+
+CMD ["app.lambda_handler.handler"]

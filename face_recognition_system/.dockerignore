@@ -1,0 +1,7 @@
+.git
+.venv
+__pycache__
+*.py[cod]
+.env
+.aws-sam
+.pytest_cache
