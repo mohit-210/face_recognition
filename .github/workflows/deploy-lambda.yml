@@ -1,6 +1,7 @@
 name: Deploy Face Engine to AWS Lambda
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
