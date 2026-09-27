@@ -40,6 +40,35 @@ jobs:
               --repository-name "$ECR_REPOSITORY" \
               --region "$AWS_REGION"
 
+      - name: Permit Lambda to retrieve the private image
+        run: |
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          cat > /tmp/lambda-ecr-policy.json <<EOF
+          {
+            "Version": "2008-10-17",
+            "Statement": [
+              {
+                "Sid": "LambdaECRImageRetrieval",
+                "Effect": "Allow",
+                "Principal": {"Service": "lambda.amazonaws.com"},
+                "Action": [
+                  "ecr:BatchGetImage",
+                  "ecr:GetDownloadUrlForLayer"
+                ],
+                "Condition": {
+                  "StringLike": {
+                    "aws:sourceArn": "arn:aws:lambda:$AWS_REGION:$ACCOUNT_ID:function:$LAMBDA_FUNCTION_NAME"
+                  }
+                }
+              }
+            ]
+          }
+          EOF
+          aws ecr set-repository-policy \
+            --repository-name "$ECR_REPOSITORY" \
+            --policy-text file:///tmp/lambda-ecr-policy.json \
+            --region "$AWS_REGION"
+
       - name: Sign in to Amazon ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
