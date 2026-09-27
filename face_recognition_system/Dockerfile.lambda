@@ -1,4 +1,18 @@
-# Lambda container image. Build from the face_recognition_system directory.
+# Build InsightFace's native extension in AWS's Amazon Linux build image so the
+# generated binary is compatible with the Lambda Python 3.11 runtime.
+FROM public.ecr.aws/sam/build-python3.11 AS build
+
+WORKDIR /build
+COPY requirements.txt ./
+
+# InsightFace 0.7.3 is distributed as source. Its setup needs both NumPy and
+# Cython; --no-build-isolation prevents pip from attempting to build an
+# unpinned newer NumPy in an isolated environment.
+RUN pip install --no-cache-dir --target /python numpy==2.2.1 setuptools wheel Cython \
+    && PYTHONPATH=/python pip install --no-cache-dir --no-build-isolation \
+        --target /python -r requirements.txt
+
+# AWS Lambda runtime image. Build tools are intentionally not copied here.
 FROM public.ecr.aws/lambda/python:3.11
 
 ENV INSIGHTFACE_HOME=/opt/insightface \
@@ -11,14 +25,7 @@ ENV INSIGHTFACE_HOME=/opt/insightface \
     MKL_NUM_THREADS=2 \
     NUMEXPR_NUM_THREADS=2
 
-COPY requirements.txt ${LAMBDA_TASK_ROOT}/
-# InsightFace is distributed as a source package and requests an unpinned NumPy
-# build dependency. Install our compatible NumPy wheel first, then disable build
-# isolation so pip does not attempt to compile a newer NumPy in the Lambda image.
-RUN pip install --no-cache-dir --target ${LAMBDA_TASK_ROOT} numpy==2.2.1 setuptools wheel \
-    && PYTHONPATH=${LAMBDA_TASK_ROOT} pip install --no-cache-dir --no-build-isolation \
-        --target ${LAMBDA_TASK_ROOT} -r ${LAMBDA_TASK_ROOT}/requirements.txt
-
+COPY --from=build /python ${LAMBDA_TASK_ROOT}/
 COPY app ${LAMBDA_TASK_ROOT}/app
 
 # InsightFace normally downloads this model on its first inference. Lambda's
