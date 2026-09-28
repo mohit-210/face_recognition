@@ -14,6 +14,7 @@ class FaceEmbedder:
     def __init__(self) -> None:
         settings = get_settings()
         self.model_name = settings.arcface_model_name.strip() or "buffalo_l"
+        self.insightface_root = settings.insightface_root.strip() or None
         self.det_size = int(settings.arcface_det_size)
         self.ctx_id = int(getattr(settings, "arcface_ctx_id", -1))
         self.providers = [
@@ -24,6 +25,8 @@ class FaceEmbedder:
 
     def _build_model(self, providers: list[str], ctx_id: int) -> FaceAnalysis:
         kwargs = {"name": self.model_name}
+        if self.insightface_root:
+            kwargs["root"] = self.insightface_root
         if providers:
             kwargs["providers"] = providers
         model = FaceAnalysis(**kwargs)

@@ -7,6 +7,10 @@ class Settings(BaseSettings):
     app_name: str = "Laravel Face Engine"
     face_engine_key: str = "change-face-engine-key"
     arcface_model_name: str = "buffalo_s"
+    # FaceAnalysis only uses a custom model location when it is passed as
+    # ``root``. This must be an image-owned read-only path on Lambda; the
+    # default resolves beneath the runtime user's home directory.
+    insightface_root: str = "/opt/insightface"
     arcface_onnx_providers: str = "CPUExecutionProvider"
     arcface_ctx_id: int = Field(default=-1, ge=-1, le=8)
     arcface_det_size: int = Field(default=320, ge=320, le=1280)

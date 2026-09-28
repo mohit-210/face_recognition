@@ -32,6 +32,6 @@ COPY app ${LAMBDA_TASK_ROOT}/app
 
 # InsightFace normally downloads this model on its first inference. Lambda's
 # filesystem is read-only except /tmp, so download it while building instead.
-RUN python -c "from insightface.app import FaceAnalysis; model = FaceAnalysis(name='buffalo_s', providers=['CPUExecutionProvider']); model.prepare(ctx_id=-1, det_size=(320, 320))"
+RUN python -c "from insightface.app import FaceAnalysis; model = FaceAnalysis(name='buffalo_s', root='/opt/insightface', providers=['CPUExecutionProvider']); model.prepare(ctx_id=-1, det_size=(320, 320))"
 
 CMD ["app.lambda_handler.handler"]
